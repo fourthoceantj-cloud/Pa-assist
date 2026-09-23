@@ -3,7 +3,7 @@
   'use strict';
 
   var SP = window.PA_SPEECH;
-  var APP_VERSION = '1.0.0';
+  var APP_VERSION = '1.1.0';
   var SETTINGS_KEY = 'pa-assist-settings-v1';
 
   var S = {
@@ -29,7 +29,7 @@
     });
   }
   function loadSettings() {
-    var def = { jaVoice: '', enVoice: '', rate: 0.9 };
+    var def = { jaVoice: '', enVoice: '', rate: 0.9, lang: 'both' };
     try {
       var raw = localStorage.getItem(SETTINGS_KEY);
       if (raw) { var o = JSON.parse(raw); for (var k in o) def[k] = o[k]; }
@@ -66,6 +66,35 @@
   }
   function patternById(id) {
     return S.data.patterns.filter(function (p) { return p.id === id; })[0];
+  }
+  var LANGS = [
+    { id: 'ja', label: '日本語のみ', short: '日本語' },
+    { id: 'en', label: '英語のみ', short: 'English' },
+    { id: 'both', label: '日本語→英語', short: '日→英' }
+  ];
+  function langMode() { var m = S.settings.lang; return m === 'ja' || m === 'en' ? m : 'both'; }
+  function langLabel(m) { return LANGS.filter(function (l) { return l.id === (m || langMode()); })[0].label; }
+  function langOk(segLang, jaOnly) {
+    var m = langMode();
+    return m === 'both' || segLang === m || !!jaOnly;
+  }
+  function langSelector() {
+    var m = langMode();
+    var h = '<div class="lang"><span class="lang-l">放送する言語</span><div class="lang-seg" role="group" aria-label="放送する言語">';
+    LANGS.forEach(function (l) {
+      h += '<button type="button" data-act="lang" data-v="' + l.id + '" class="' + (m === l.id ? 'is-on' : '') +
+        '" aria-pressed="' + (m === l.id) + '">' + esc(l.label) + '</button>';
+    });
+    return h + '</div></div>';
+  }
+  /* 選んだ言語の音声が端末にない場合の案内（なければ空） */
+  function missingVoice(needJa, needEn) {
+    if (!SP.supported()) return 'この端末は読み上げに対応していません';
+    if (!SP.voices().length) return '';
+    var v = currentVoices();
+    if (needJa && !v.ja) return '日本語の音声がありません（設定を確認）';
+    if (needEn && !v.en) return '英語の音声がありません（設定を確認）';
+    return '';
   }
   function currentVoices() {
     return {
@@ -115,7 +144,9 @@
     var ab = floorInfo(abId);
     var noAbove = p.floor === 'fireAndAbove' && fid && !abId;
     return p.segments.filter(function (s) {
-      return !s.option || st.opts[s.option];
+      if (s.option && !st.opts[s.option]) return false;
+      if (s.type === 'speech' && !langOk(s.lang, s.jaOnly)) return false;
+      return true;
     }).map(function (s) {
       var t = noAbove && s.textNoAbove ? s.textNoAbove : s.text;
       var k = noAbove && s.kanaNoAbove ? s.kanaNoAbove : s.kana;
@@ -203,6 +234,7 @@
     if (!p) return go('#/');
     var st = setupFor(p);
     var html = header(p.title, p.id, p.tone) + '<main class="pad">';
+    html += langSelector();
 
     if (p.floor) {
       var fl = floorInfo(st.floor);
@@ -242,10 +274,14 @@
     html += '</div></div>';
 
     var segs = resolveSegments(p, st);
-    var ready = !p.floor || !!st.floor;
+    var needJa = segs.some(function (x) { return x.lang === 'ja'; });
+    var needEn = segs.some(function (x) { return x.lang === 'en'; });
+    var miss = missingVoice(needJa, needEn);
+    var ready = (!p.floor || !!st.floor) && !miss;
     var fl2 = floorInfo(st.floor);
+    var label = miss ? miss : (p.floor && !st.floor ? '階を選んでください' : (fl2 ? fl2.ja + 'で放送開始' : '放送開始'));
     html += '<button type="button" class="go tone-' + p.tone + '" data-act="start" ' + (ready ? '' : 'disabled') + '>' +
-      icon('play', 22, '#fff') + (ready ? (fl2 ? esc(fl2.ja) + 'で放送開始' : '放送開始') : '階を選んでください') + '</button>';
+      icon('play', 22, '#fff') + esc(label) + '</button>';
     html += '<div class="seq">' + segs.map(function (s) { return esc(s.label); }).join(' → ') +
       (st.repeat > 1 ? '　× ' + st.repeat + '回' : '') + '</div>';
 
@@ -277,6 +313,7 @@
       html += '<a class="' + (q.id === p.id ? 'is-on' : '') + '" href="#/manual/' + q.id + '">' + q.id + '</a>';
     });
     html += '</div>';
+    html += langSelector();
     html += '<div class="tip">放送設備のマイクで、この文をそのまま読んでください。「／」で一呼吸。英語はカタカナを、ゆっくり・はっきり。' +
       (p.floor && !fl ? '<br><b>階数が未選択のため「〇〇階」と表示しています。</b>' : '') + '</div>';
 
@@ -310,7 +347,7 @@
   function customState() {
     if (!S.custom) {
       var t = S.data.customTemplates[0];
-      S.custom = { tpl: t.id, ja: t.ja, en: t.en, useEn: true, chime: true, repeat: 2, error: '' };
+      S.custom = { tpl: t.id, ja: t.ja, en: t.en, chime: true, repeat: 2, error: '' };
     }
     return S.custom;
   }
@@ -323,11 +360,13 @@
       html += '<button type="button" class="chip ' + (c.tpl === t.id ? 'is-on' : '') + '" data-act="tpl" data-v="' + t.id + '">' + esc(t.label) + '</button>';
     });
     html += '</div>';
-    html += '<label class="field"><span>日本語<small>［ ］の部分を書き換えてください</small></span>' +
-      '<textarea rows="4" data-act="cja" lang="ja">' + esc(c.ja) + '</textarea></label>';
-    html += '<label class="toggle"><span><b>英語も流す</b><small>日本語の後に続けて読み上げ</small></span>' +
-      '<input type="checkbox" data-act="cuseen"' + (c.useEn ? ' checked' : '') + '></label>';
-    if (c.useEn) {
+    var m = langMode();
+    html += langSelector();
+    if (m !== 'en') {
+      html += '<label class="field"><span>日本語<small>［ ］の部分を書き換えてください</small></span>' +
+        '<textarea rows="4" data-act="cja" lang="ja">' + esc(c.ja) + '</textarea></label>';
+    }
+    if (m !== 'ja') {
       html += '<label class="field"><span>English<small>ひな形には対訳が入っています</small></span>' +
         '<textarea rows="4" data-act="cen" lang="en">' + esc(c.en) + '</textarea></label>';
     }
@@ -345,10 +384,12 @@
     app.innerHTML = html;
   }
   function customValidate(c) {
-    if (!c.ja.trim()) return '日本語の文を入力してください。';
-    if (/[［\[]/.test(c.ja) || (c.useEn && /[［\[]/.test(c.en))) return '［ ］の部分が残っています。書き換えてから放送してください。';
-    if (c.useEn && !c.en.trim()) return '英語の文を入力するか、「英語も流す」をオフにしてください。';
-    return '';
+    var m = langMode();
+    var useJa = m !== 'en', useEn = m !== 'ja';
+    if (useJa && !c.ja.trim()) return '日本語の文を入力してください。';
+    if (useEn && !c.en.trim()) return '英語の文を入力してください。';
+    if ((useJa && /[［\[]/.test(c.ja)) || (useEn && /[［\[]/.test(c.en))) return '［ ］の部分が残っています。書き換えてから放送してください。';
+    return missingVoice(useJa, useEn);
   }
 
   /* ---------- 設定 ---------- */
@@ -511,6 +552,7 @@
     var p = r.id ? patternById(r.id) : null;
 
     switch (act) {
+      case 'lang': S.settings.lang = v; saveSettings(); render(); break;
       case 'floor': setupFor(p).floor = v; renderPattern(p.id); break;
       case 'repeat': setupFor(p).repeat = parseInt(v, 10); renderPattern(p.id); break;
       case 'start': {
@@ -522,6 +564,7 @@
           var ab = aboveOf(st.floor);
           sub = '避難：' + fl.ja + (ab ? '・' + floorInfo(ab).ja : '') + (st.opts.standby ? '　／　その他の階：待機' : '');
         }
+        sub = (sub ? sub + '　／　' : '') + langLabel();
         var title = p.id + ' ' + p.title;
         var steps = buildSteps(resolveSegments(p, st), st.repeat);
         var href = '#/manual/' + p.id + (st.floor ? '/' + st.floor : '');
@@ -551,8 +594,8 @@
         for (var i = 0; i < rep; i++) {
           if (i > 0) steps2.push({ kind: 'pause', ms: 1500, label: '間', loop: i });
           if (i === 0 && c2.chime && !test) steps2.push({ kind: 'sound', sound: 'chime', label: 'チャイム', loop: i });
-          steps2.push({ kind: 'speech', lang: 'ja', text: c2.ja.trim(), label: '日本語', loop: i });
-          if (c2.useEn) steps2.push({ kind: 'speech', lang: 'en', text: c2.en.trim(), label: 'English', loop: i });
+          if (langMode() !== 'en') steps2.push({ kind: 'speech', lang: 'ja', text: c2.ja.trim(), label: '日本語', loop: i });
+          if (langMode() !== 'ja') steps2.push({ kind: 'speech', lang: 'en', text: c2.en.trim(), label: 'English', loop: i });
         }
         var ttl = test ? '臨時放送（試聴）' : '臨時放送';
         var csub = test ? '放送設備につなぐ前に端末で確認' : '';
@@ -582,7 +625,6 @@
       case 'opt': setupFor(patternById(S.route.id)).opts[el.getAttribute('data-v')] = el.checked; renderPattern(S.route.id); break;
       case 'cja': c.ja = el.value; break;
       case 'cen': c.en = el.value; break;
-      case 'cuseen': c.useEn = el.checked; renderCustom(); break;
       case 'cchime': c.chime = el.checked; break;
       case 'jav': S.settings.jaVoice = el.value; saveSettings(); renderSettings(); break;
       case 'env': S.settings.enVoice = el.value; saveSettings(); renderSettings(); break;

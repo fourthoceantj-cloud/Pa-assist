@@ -1,7 +1,7 @@
 /* オフライン用 Service Worker
  * 文言や画面を更新したら CACHE の版番号を上げてください（例：v1.0.1）。
  */
-var CACHE = 'pa-assist-v1.0.0';
+var CACHE = 'pa-assist-v1.1.0';
 var FONT_CACHE = 'pa-assist-fonts';
 var SHELL = [
   './',
