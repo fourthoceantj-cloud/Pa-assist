@@ -1,7 +1,8 @@
 /* オフライン用 Service Worker
- * 文言や画面を更新したら CACHE の版番号を上げてください（例：v1.0.1）。
+ * 文言や画面を更新したら CACHE の版番号を上げてください（例：v1.1.3）。
+ * 版番号が変わると、各端末は次に開いたとき自動で最新版に入れ替わります。
  */
-var CACHE = 'pa-assist-v1.1.1';
+var CACHE = 'pa-assist-v1.1.2';
 var FONT_CACHE = 'pa-assist-fonts';
 var SHELL = [
   './',
@@ -17,7 +18,11 @@ var SHELL = [
 ];
 
 self.addEventListener('install', function (e) {
-  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }));
+  // cache:'reload' … ブラウザに残った古いファイルではなく、必ずサーバーの最新を取りに行く
+  // skipWaiting …… 新しい版を待たせずにすぐ有効にする
+  e.waitUntil(caches.open(CACHE).then(function (c) {
+    return c.addAll(SHELL.map(function (u) { return new Request(u, { cache: 'reload' }); }));
+  }).then(function () { return self.skipWaiting(); }));
 });
 
 self.addEventListener('activate', function (e) {
@@ -53,7 +58,7 @@ self.addEventListener('fetch', function (e) {
 
   // 文言データ：通信できれば最新、できなければキャッシュ
   if (url.pathname.endsWith('/data/announcements.json')) {
-    e.respondWith(fetch(req).then(function (res) {
+    e.respondWith(fetch(req.url, { cache: 'no-store' }).then(function (res) {
       var copy = res.clone();
       caches.open(CACHE).then(function (c) { c.put('./data/announcements.json', copy); });
       return res;

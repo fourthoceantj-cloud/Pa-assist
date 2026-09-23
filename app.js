@@ -3,7 +3,7 @@
   'use strict';
 
   var SP = window.PA_SPEECH;
-  var APP_VERSION = '1.1.1';
+  var APP_VERSION = '1.1.2';
   var SETTINGS_KEY = 'pa-assist-settings-v1';
 
   var S = {
@@ -170,6 +170,7 @@
           if (r > 0 && s.firstLoopOnly) return;
           steps.push({ kind: 'sound', sound: s.sound, label: s.label, loop: r });
         } else {
+          if (!langOk(s.lang)) return; // 選んでいない言語の文は絶対に流さない（英語のみ → 役員招集は流れない）
           steps.push({ kind: 'speech', lang: s.lang, text: s.text, label: s.label, loop: r });
         }
       });
@@ -227,7 +228,7 @@
       '<a class="card card-sm" href="#/manual/A">' + icon('mic', 22) +
       '<span class="card-body"><span class="card-t">手動読み上げ</span><span class="card-s">音が出ないとき</span></span></a>' +
       '</div>';
-    html += '<p class="foot-note">文言データ ' + esc(S.data.version) + ' 版 ／ アプリ ' + APP_VERSION + '</p>';
+    html += '<p class="foot-note">アプリ <b>v' + APP_VERSION + '</b> ／ 文言データ ' + esc(S.data.version) + ' 版</p>';
     html += '</main>';
     app.innerHTML = html;
   }
@@ -465,6 +466,7 @@
     overlay.hidden = true;
     overlay.innerHTML = '';
     document.body.classList.remove('is-onair');
+    if (S.pendingReload) { S.pendingReload = false; location.reload(); }
   }
   function fmt(ms) {
     var s = Math.floor(ms / 1000);
@@ -668,42 +670,35 @@
     window.scrollTo(0, 0);
   }
 
-  /* ---------- Service Worker（オフライン化と更新） ---------- */
+  /* ---------- Service Worker（オフライン化と更新） ----------
+   * 新しい版がGitHubに上がったら、次に開いたとき自動で入れ替えて再読み込みする。
+   * 放送中は再読み込みせず、停止・終了してから行う。
+   */
   function registerSW() {
     if (!('serviceWorker' in navigator)) return;
-    navigator.serviceWorker.register('./sw.js').then(function (reg) {
-      function track(w) {
-        w.addEventListener('statechange', function () {
-          if (w.state === 'installed' && navigator.serviceWorker.controller) {
-            S.swWaiting = w;
-            if (S.route.name === 'home') renderHome();
-          }
-        });
-      }
-      if (reg.waiting && navigator.serviceWorker.controller) S.swWaiting = reg.waiting;
-      reg.addEventListener('updatefound', function () { if (reg.installing) track(reg.installing); });
-      navigator.serviceWorker.addEventListener('controllerchange', function () {
-        if (S.route.name === 'home') renderHome();
-      });
-    }).catch(function () { /* file:// 等では登録できない */ });
+    var hadController = !!navigator.serviceWorker.controller;
     var refreshing = false;
     navigator.serviceWorker.addEventListener('controllerchange', function () {
-      if (S.reloadOnControllerChange && !refreshing) { refreshing = true; location.reload(); }
+      if (!hadController) { hadController = true; if (S.route.name === 'home') renderHome(); return; }
+      if (refreshing) return;
+      if (S.playing) { S.pendingReload = true; return; }
+      refreshing = true;
+      location.reload();
     });
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then(function (reg) {
+      reg.update().catch(function () { /* オフライン */ });
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') reg.update().catch(function () { /* オフライン */ });
+      });
+    }).catch(function () { /* file:// 等では登録できない */ });
   }
-  function applySwUpdate() {
-    if (!S.swWaiting) return location.reload();
-    S.reloadOnControllerChange = true;
-    S.swWaiting.postMessage('skipWaiting');
-  }
+  function applySwUpdate() { location.reload(); }
   function refreshApp() {
     if (!('serviceWorker' in navigator)) return location.reload();
     navigator.serviceWorker.getRegistration().then(function (reg) {
       if (!reg) return location.reload();
-      reg.update().then(function () {
-        if (reg.waiting) { S.swWaiting = reg.waiting; applySwUpdate(); }
-        else location.reload();
-      });
+      reg.update().then(function () { setTimeout(function () { location.reload(); }, 800); },
+        function () { location.reload(); });
     });
   }
 
