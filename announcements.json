@@ -1,0 +1,362 @@
+{
+  "version": "2026-09-23c",
+  "source": "消防計画 別添 運用資料集「２ 管理事務室用 緊急放送スクリプト集」",
+  "notes": "{floor_ja} {floor_en} {floor_kana} は選択した階、{above_ja} {above_en} {above_kana} は直上階に置き換わります。直上階がない（最上階）場合は textNoAbove / kanaNoAbove が使われます。 役員招集は日本語の文のみのため、「英語のみ」を選ぶと流れません。",
+  "speechFixes": {
+    "ja": {
+      "１１９番": "いちいちきゅう番",
+      "火元階": "ひもとかい",
+      "直上階": "ちょくじょうかい"
+    },
+    "en": {}
+  },
+  "groups": [
+    {
+      "id": "fire",
+      "label": "火災",
+      "labelEn": "FIRE"
+    },
+    {
+      "id": "quake",
+      "label": "地震・津波",
+      "labelEn": "QUAKE / TSUNAMI"
+    }
+  ],
+  "patterns": [
+    {
+      "id": "A",
+      "group": "fire",
+      "tone": "fire",
+      "title": "第一報（火災警報作動）",
+      "subtitle": "119番通報の直後に ／ 階数を選んで放送",
+      "floor": "single",
+      "floorPrompt": "警報が作動した階をタップ",
+      "defaultRepeat": 2,
+      "options": [
+        {
+          "id": "callBoard",
+          "label": "住宅部会役員の招集を続けて流す",
+          "hint": "在宅の役員は1階管理室へ集合（日本語のみ。「英語のみ」では流れません）",
+          "default": true
+        }
+      ],
+      "segments": [
+        {
+          "type": "sound",
+          "sound": "chime",
+          "label": "チャイム",
+          "firstLoopOnly": true
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "日本語",
+          "text": "こちらは１階管理室です。ただいま、{floor_ja}で火災警報が作動しました。直ちに消防署へ通報を行いました。現在、状況を確認しております。居住者の皆様は、慌てず、次の放送をお待ちください。繰り返します。{floor_ja}で火災警報が作動し、１１９番通報を行いました。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "English",
+          "text": "Attention please. This is the management office. A fire alarm has been activated on the {floor_en}. The fire department has been notified. We are now checking the situation. Please remain calm and wait for further announcements.",
+          "kana": "アテンション・プリーズ。／ディス・イズ・ザ・マネジメント・オフィス。／ア・ファイア・アラーム・ハズ・ビーン・アクティベイテッド・オン・ザ・{floor_kana}。／ザ・ファイア・デパートメント・ハズ・ビーン・ノーティファイド。／ウィー・アー・ナウ・チェッキング・ザ・シチュエーション。／プリーズ・リメイン・カーム、／アンド・ウェイト・フォー・ファーザー・アナウンスメンツ。"
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "役員招集",
+          "option": "callBoard",
+          "text": "重要。住宅部会役員の方にお知らせします。在宅している住宅部会役員の方は、ご自身の安全を確認し、至急、１階管理室へ集合してください。"
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "group": "fire",
+      "tone": "fire",
+      "title": "火災確認・避難指示",
+      "subtitle": "火元階＋直上階は避難 ／ 他の階は待機",
+      "floor": "fireAndAbove",
+      "floorPrompt": "火災を確認した階（火元階）をタップ",
+      "defaultRepeat": 2,
+      "options": [
+        {
+          "id": "standby",
+          "label": "続けて「その他の階は待機」を流す",
+          "hint": "窓とドアを閉めて自宅待機 ／ 階段に入らない",
+          "default": true
+        }
+      ],
+      "segments": [
+        {
+          "type": "sound",
+          "sound": "siren",
+          "label": "警報音",
+          "firstLoopOnly": true
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "避難指示",
+          "text": "こちらは１階管理室です。{floor_ja}での火災を確認しました。避難指示です。{floor_ja}、火元階、および{above_ja}、直上階にお住まいの方は、落ち着いて非常階段を使い、地上へ避難してください。エレベーターは絶対に使わないでください。",
+          "textNoAbove": "こちらは１階管理室です。{floor_ja}での火災を確認しました。避難指示です。{floor_ja}、火元階にお住まいの方は、落ち着いて非常階段を使い、地上へ避難してください。エレベーターは絶対に使わないでください。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "Evacuate",
+          "text": "Emergency announcement. A fire has been confirmed on the {floor_en}. Residents on the {floor_en} and the floor directly above, the {above_en}: please evacuate now using the emergency stairs. Do not use the elevators.",
+          "textNoAbove": "Emergency announcement. A fire has been confirmed on the {floor_en}. Residents on the {floor_en}: please evacuate now using the emergency stairs. Do not use the elevators.",
+          "kana": "エマージェンシー・アナウンスメント。／ア・ファイア・ハズ・ビーン・コンファームド・オン・ザ・{floor_kana}。／レジデンツ・オン・ザ・{floor_kana}、／アンド・ザ・フロア・ダイレクトリー・アバブ、ザ・{above_kana}、／プリーズ・イバキュエイト・ナウ、／ユージング・ジ・エマージェンシー・ステアーズ。／ドゥ・ノット・ユーズ・ジ・エレベーターズ。",
+          "kanaNoAbove": "エマージェンシー・アナウンスメント。／ア・ファイア・ハズ・ビーン・コンファームド・オン・ザ・{floor_kana}。／レジデンツ・オン・ザ・{floor_kana}、／プリーズ・イバキュエイト・ナウ、／ユージング・ジ・エマージェンシー・ステアーズ。／ドゥ・ノット・ユーズ・ジ・エレベーターズ。"
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "待機指示",
+          "option": "standby",
+          "text": "待機指示です。その他の階の方は、煙が入らないよう窓とドアを閉め、自宅で待機してください。階段に煙が充満するのを防ぐため、むやみに外に出ないでください。消防隊の指示に従ってください。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "Stay",
+          "option": "standby",
+          "text": "Residents on all other floors: please stay inside your unit, close all windows and doors, and wait for instructions. Do not enter the stairways unless instructed. Follow the fire department's instructions.",
+          "kana": "レジデンツ・オン・オール・アザー・フロアーズ、／プリーズ・ステイ・インサイド・ユア・ユニット、／クローズ・オール・ウィンドウズ・アンド・ドアーズ、／アンド・ウェイト・フォー・インストラクションズ。／ドゥ・ノット・エンター・ザ・ステアウェイズ・アンレス・インストラクテッド。／フォロー・ザ・ファイア・デパートメンツ・インストラクションズ。"
+        }
+      ]
+    },
+    {
+      "id": "C",
+      "group": "fire",
+      "tone": "ok",
+      "title": "誤報（訂正放送）",
+      "subtitle": "火災の危険なし ／ 階数入力なし",
+      "floor": null,
+      "defaultRepeat": 1,
+      "options": [],
+      "segments": [
+        {
+          "type": "sound",
+          "sound": "chime",
+          "label": "チャイム",
+          "firstLoopOnly": true
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "日本語",
+          "text": "こちらは１階管理室です。先ほどの火災警報は、確認の結果、誤作動と判明しました。火災の危険はありません。お騒がせいたしました。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "English",
+          "text": "This is the management office. The earlier fire alarm has been confirmed to be a false alarm. There is no danger of fire. We apologize for the inconvenience.",
+          "kana": "ディス・イズ・ザ・マネジメント・オフィス。／ジ・アーリア・ファイア・アラーム・ハズ・ビーン・コンファームド・トゥ・ビー・ア・フォールス・アラーム。／ゼア・イズ・ノー・デンジャー・オブ・ファイア。／ウィー・アポロジャイズ・フォー・ジ・インコンビーニエンス。"
+        }
+      ]
+    },
+    {
+      "id": "D",
+      "group": "quake",
+      "tone": "info",
+      "title": "地震直後（安全確認）",
+      "subtitle": "揺れが収まった直後に ／ 在宅避難の呼びかけ",
+      "floor": null,
+      "defaultRepeat": 1,
+      "options": [
+        {
+          "id": "severe",
+          "label": "震度5強以上（追加文を流す）",
+          "hint": "トイレ・排水の使用停止 ＋ 役員招集（招集は日本語のみ。「英語のみ」では流れません）",
+          "default": true
+        }
+      ],
+      "segments": [
+        {
+          "type": "sound",
+          "sound": "chime",
+          "label": "チャイム",
+          "firstLoopOnly": true
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "日本語",
+          "text": "こちらは１階管理室です。先ほど、強い地震がありました。皆様、落ち着いて火の始末をし、身の安全を確保してください。現在、エレベーターは安全装置により停止している可能性があります。閉じ込められている方は、インターホンで係員を呼び出し、救助を待ってください。無理に脱出せず、そのままでお待ちください。建物は安全ですので、原則として自宅内に留まってください。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "English",
+          "text": "This is the management office. A strong earthquake has just occurred. Please stay calm, turn off any open flames, and protect yourself. Elevators may have stopped automatically. If you are trapped in an elevator, use the intercom and wait for rescue. Do not try to force the doors open. The building is structurally safe. In principle, please stay inside your unit.",
+          "kana": "ディス・イズ・ザ・マネジメント・オフィス。／ア・ストロング・アースクエイク・ハズ・ジャスト・オカード。／プリーズ・ステイ・カーム、／ターン・オフ・エニー・オープン・フレイムズ、／アンド・プロテクト・ユアセルフ。／エレベーターズ・メイ・ハブ・ストップト・オートマティカリー。／イフ・ユー・アー・トラップト・イン・アン・エレベーター、／ユーズ・ジ・インターコム・アンド・ウェイト・フォー・レスキュー。／ドゥ・ノット・トライ・トゥ・フォース・ザ・ドアーズ・オープン。／ザ・ビルディング・イズ・ストラクチュラリー・セーフ。／イン・プリンシプル、プリーズ・ステイ・インサイド・ユア・ユニット。"
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "追加文",
+          "option": "severe",
+          "text": "トイレ・排水は、安全確認の放送があるまで使用しないでください。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "Addition",
+          "option": "severe",
+          "text": "Do not flush toilets or use drains until safety is confirmed by announcement.",
+          "kana": "ドゥ・ノット・フラッシュ・トイレッツ、／オア・ユーズ・ドレインズ、／アンティル・セーフティ・イズ・コンファームド・バイ・アナウンスメント。"
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "役員招集",
+          "option": "severe",
+          "text": "在宅の住宅部会役員の方は、安全を確認し、１階管理室へ連絡または集合してください。"
+        }
+      ]
+    },
+    {
+      "id": "E",
+      "group": "quake",
+      "tone": "info",
+      "title": "津波警報（垂直避難）",
+      "subtitle": "低層階は階段で上階へ ／ 屋外に出ない",
+      "floor": null,
+      "defaultRepeat": 2,
+      "options": [],
+      "segments": [
+        {
+          "type": "sound",
+          "sound": "siren",
+          "label": "警報音",
+          "firstLoopOnly": true
+        },
+        {
+          "type": "speech",
+          "lang": "ja",
+          "label": "日本語",
+          "text": "こちらは１階管理室です。横須賀市に津波警報が発表されました。低層階にお住まいの方は、エレベーターを使わず、階段で上の階へ避難してください。地上・屋外には出ないでください。"
+        },
+        {
+          "type": "speech",
+          "lang": "en",
+          "label": "English",
+          "text": "A tsunami warning has been issued for Yokosuka City. Residents on the lower floors: please move to the upper floors using the stairs. Do not use the elevators. Do not go outside.",
+          "kana": "ア・ツナミ・ウォーニング・ハズ・ビーン・イシュード・フォー・ヨコスカ・シティ。／レジデンツ・オン・ザ・ロウアー・フロアーズ、／プリーズ・ムーブ・トゥ・ジ・アッパー・フロアーズ、／ユージング・ザ・ステアーズ。／ドゥ・ノット・ユーズ・ジ・エレベーターズ。／ドゥ・ノット・ゴー・アウトサイド。"
+        }
+      ]
+    }
+  ],
+  "floors": {
+    "list": [
+      "B2",
+      "B1",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+      "15",
+      "16",
+      "17",
+      "18",
+      "19",
+      "20",
+      "21",
+      "22",
+      "23",
+      "24",
+      "25",
+      "26",
+      "27",
+      "28",
+      "29",
+      "30",
+      "31"
+    ],
+    "kana": {
+      "B2": "ベースメント・レベル・ツー",
+      "B1": "ベースメント・レベル・ワン",
+      "1": "ファースト・フロア",
+      "2": "セカンド・フロア",
+      "3": "サード・フロア",
+      "4": "フォース・フロア",
+      "5": "フィフス・フロア",
+      "6": "シックスス・フロア",
+      "7": "セブンス・フロア",
+      "8": "エイス・フロア",
+      "9": "ナインス・フロア",
+      "10": "テンス・フロア",
+      "11": "イレブンス・フロア",
+      "12": "トゥエルフス・フロア",
+      "13": "サーティーンス・フロア",
+      "14": "フォーティーンス・フロア",
+      "15": "フィフティーンス・フロア",
+      "16": "シックスティーンス・フロア",
+      "17": "セブンティーンス・フロア",
+      "18": "エイティーンス・フロア",
+      "19": "ナインティーンス・フロア",
+      "20": "トゥエンティエス・フロア",
+      "21": "トゥエンティ・ファースト・フロア",
+      "22": "トゥエンティ・セカンド・フロア",
+      "23": "トゥエンティ・サード・フロア",
+      "24": "トゥエンティ・フォース・フロア",
+      "25": "トゥエンティ・フィフス・フロア",
+      "26": "トゥエンティ・シックスス・フロア",
+      "27": "トゥエンティ・セブンス・フロア",
+      "28": "トゥエンティ・エイス・フロア",
+      "29": "トゥエンティ・ナインス・フロア",
+      "30": "サーティエス・フロア",
+      "31": "サーティ・ファースト・フロア"
+    }
+  },
+  "customTemplates": [
+    {
+      "id": "elevator",
+      "label": "エレベーター停止",
+      "ja": "こちらは１階管理室です。現在、エレベーターを停止しています。復旧は［時刻］の予定です。階段をご利用ください。",
+      "en": "This is the management office. The elevators are currently out of service. They are expected to resume at [time]. Please use the stairs."
+    },
+    {
+      "id": "water",
+      "label": "断水",
+      "ja": "こちらは１階管理室です。現在、断水しています。復旧は［時刻］の予定です。ご不便をおかけしますが、復旧までお待ちください。",
+      "en": "This is the management office. The water supply is currently cut off. It is expected to be restored at [time]. We apologize for the inconvenience."
+    },
+    {
+      "id": "power",
+      "label": "停電",
+      "ja": "こちらは１階管理室です。現在、停電しています。エレベーターは停止していますので、階段をご利用ください。復旧までお待ちください。",
+      "en": "This is the management office. There is currently a power outage. The elevators are stopped, so please use the stairs. Please wait until power is restored."
+    },
+    {
+      "id": "allclear",
+      "label": "安全確認完了（トイレ使用可）",
+      "ja": "こちらは１階管理室です。建物の安全確認が終わりました。トイレと排水を使用していただいて差し支えありません。",
+      "en": "This is the management office. The building safety check has been completed. You may now use toilets and drains."
+    },
+    {
+      "id": "nankai",
+      "label": "南海トラフ臨時情報",
+      "ja": "こちらは１階管理室です。南海トラフ地震臨時情報、［巨大地震警戒／巨大地震注意］が発表されました。家具の固定、備蓄品、避難経路を確認し、今後の情報に注意してください。",
+      "en": "This is the management office. Nankai Trough Earthquake Extra Information, [Megaquake Warning / Megaquake Advisory], has been issued. Please check that your furniture is secured, and check your emergency supplies and evacuation routes. Stay alert for further information."
+    },
+    {
+      "id": "blank",
+      "label": "白紙から入力",
+      "ja": "",
+      "en": ""
+    }
+  ]
+}
