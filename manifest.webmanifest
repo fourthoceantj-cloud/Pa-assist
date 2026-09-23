@@ -1,0 +1,16 @@
+{
+  "name": "館内放送アシスト",
+  "short_name": "館内放送",
+  "description": "管理事務室用 緊急放送（日本語・英語）読み上げアプリ",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F3F1EC",
+  "theme_color": "#17191E",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
