@@ -46,7 +46,7 @@
     return list.slice().sort(function (a, b) { return score(b) - score(a); })[0];
   }
 
-  /* 文ごとに分割（日本語は「。」、英語は . ! ? : の後の空白） */
+  /* 文ごとに分割（日本語は「。」、英語は . ! ? : の後） */
   function splitSentences(text, lang) {
     if (!text) return [];
     // 古い iOS でも動くよう後読み（lookbehind）は使わない
