@@ -3,20 +3,25 @@
   'use strict';
 
   var SP = window.PA_SPEECH;
-  var APP_VERSION = '1.1.2';
+  var APP_VERSION = '1.2.0';
   var SETTINGS_KEY = 'pa-assist-settings-v1';
+  /* 訓練モードの自動解除までの時間（訓練モードのまま本番を迎えないため） */
+  var DRILL_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
   var S = {
     data: null,
     route: { name: 'home' },
-    prevRoute: null,
     setup: {},
     custom: null,
     manualStep: 0,
     settings: loadSettings(),
     playing: null,
     wakeLock: null,
-    swWaiting: null
+    pendingReload: false,
+    /* 訓練モードは端末に保存しない：アプリを開き直すと必ず「本番」から始まる */
+    drill: false,
+    drillSince: 0,
+    drillExpired: false
   };
 
   var app = document.getElementById('app');
@@ -67,10 +72,12 @@
   function patternById(id) {
     return S.data.patterns.filter(function (p) { return p.id === id; })[0];
   }
+
+  /* ---------- 言語 ---------- */
   var LANGS = [
-    { id: 'ja', label: '日本語のみ', short: '日本語' },
-    { id: 'en', label: '英語のみ', short: 'English' },
-    { id: 'both', label: '日本語→英語', short: '日→英' }
+    { id: 'ja', label: '日本語のみ' },
+    { id: 'en', label: '英語のみ' },
+    { id: 'both', label: '日本語→英語' }
   ];
   function langMode() { var m = S.settings.lang; return m === 'ja' || m === 'en' ? m : 'both'; }
   function langLabel(m) { return LANGS.filter(function (l) { return l.id === (m || langMode()); })[0].label; }
@@ -106,6 +113,52 @@
       en: SP.pickVoice('en', S.settings.enVoice)
     };
   }
+
+  /* ---------- 訓練モード ---------- */
+  function isDrill() {
+    if (S.drill && Date.now() - S.drillSince > DRILL_TIMEOUT_MS) {
+      S.drill = false;
+      S.drillExpired = true;
+      applyModeClass();
+    }
+    return S.drill;
+  }
+  function setDrill(on) {
+    S.drill = !!on;
+    S.drillSince = on ? Date.now() : 0;
+    S.drillExpired = false;
+    applyModeClass();
+  }
+  function applyModeClass() {
+    document.body.classList.toggle('is-drill', S.drill);
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', S.drill ? '#5E3D00' : '#17191E');
+  }
+  /* 訓練の前置き（start）・締め（end）の文。選んだ言語のものだけ */
+  function drillSegs(pos) {
+    if (!isDrill() || !S.data.drill) return [];
+    return (S.data.drill[pos] || []).filter(function (d) { return langOk(d.lang); }).map(function (d) {
+      return { type: 'speech', lang: d.lang, label: d.label, text: d.text, kana: d.kana || '', drill: true };
+    });
+  }
+  function drillStrip() {
+    if (!isDrill()) return '';
+    return '<div class="drill-strip" role="status"><span class="tag">DRILL</span><span>訓練モード</span>' +
+      '<span>放送の最初と最後に「これは訓練です」が入ります</span></div>';
+  }
+  /* 放送手順の先頭（チャイム・警報音の直後）と末尾に訓練の文を入れる */
+  function wrapDrill(steps) {
+    if (!isDrill()) return steps;
+    var head = drillSegs('start').map(function (d) { return { kind: 'speech', lang: d.lang, text: d.text, label: d.label, loop: 0, drill: true }; });
+    var tail = drillSegs('end').map(function (d) { return { kind: 'speech', lang: d.lang, text: d.text, label: d.label, loop: lastLoop(steps), drill: true }; });
+    var i = 0;
+    while (i < steps.length && steps[i].kind === 'sound') i++;
+    return steps.slice(0, i).concat(head, steps.slice(i), tail);
+  }
+  function lastLoop(steps) {
+    return steps.reduce(function (m, s) { return Math.max(m, s.loop || 0); }, 0);
+  }
+
   function icon(name, size, color) {
     size = size || 20; color = color || 'currentColor';
     var p = {
@@ -119,7 +172,9 @@
       speaker: '<path d="M3 10v4h4l5 4V6L7 10H3z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M19 6a8 8 0 0 1 0 12"/>',
       keyboard: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h2M11 9h2M15 9h2M7 13h10"/>',
       mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
-      ear: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><rect x="3" y="14" width="4" height="6" rx="1"/><rect x="17" y="14" width="4" height="6" rx="1"/>'
+      ear: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><rect x="3" y="14" width="4" height="6" rx="1"/><rect x="17" y="14" width="4" height="6" rx="1"/>',
+      bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/>',
+      flag: '<path d="M4 22V4"/><path d="M4 4h12l-2 4 2 4H4"/>'
     }[name] || '';
     return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="' + color +
       '" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + '</svg>';
@@ -129,7 +184,7 @@
       '<a class="icon-btn" href="#/" aria-label="ホームに戻る">' + icon('back', 22, '#fff') + '</a>' +
       (badge ? '<span class="badge-sm tone-' + tone + '">' + esc(badge) + '</span>' : '') +
       '<h1 class="bar-title">' + esc(title) + '</h1>' +
-      '</header>';
+      '</header>' + drillStrip();
   }
 
   /* ---------- 放送内容の組み立て ---------- */
@@ -175,7 +230,7 @@
         }
       });
     }
-    return steps;
+    return wrapDrill(steps);
   }
 
   /* ---------- ホーム ---------- */
@@ -192,16 +247,32 @@
     var local = v.ja.localService && v.en.localService ? '' : '　※一部の音声は通信が必要な可能性';
     return { tone: 'ok', title: '読み上げ準備OK　' + off, sub: '日本語：' + v.ja.name + '　／　英語：' + v.en.name + local };
   }
+  function modeSwitch() {
+    var d = isDrill();
+    var h = '<section class="mode" aria-label="動作モード"><div class="mode-h"><b>動作モード</b>' +
+      '<small>' + (d ? '開き直すと本番に戻ります' : '') + '</small></div>' +
+      '<div class="mode-seg" role="group" aria-label="本番と訓練の切り替え">' +
+      '<button type="button" class="m-live ' + (d ? '' : 'is-on') + '" data-act="mode" data-v="live" aria-pressed="' + !d + '">' +
+      icon('bell', 18) + '本番</button>' +
+      '<button type="button" class="m-drill ' + (d ? 'is-on' : '') + '" data-act="mode" data-v="drill" aria-pressed="' + d + '">' +
+      icon('flag', 18) + '訓練</button></div>';
+    h += '<div class="mode-note">' + (d
+      ? '訓練中です。すべての放送の最初に「ただいまから訓練放送を行います。これは訓練です。」、最後に「以上で訓練放送を終わります。」が入ります。3時間たつと自動で本番に戻ります。'
+      : '本番の放送です。消防訓練のときは「訓練」に切り替えてください。') + '</div></section>';
+    return h;
+  }
   function renderHome() {
     var r = readiness();
     var html = '<header class="bar bar-home">' +
       '<div class="brand">' + icon('speaker', 24, '#fff') +
-      '<div><div class="brand-name">館内放送アシスト</div><div class="brand-sub">PA ASSIST · JA / EN</div></div></div>' +
+      '<div><div class="brand-name">館内放送アシスト</div><div class="brand-sub">' +
+      (isDrill() ? 'DRILL MODE · 訓練' : 'PA ASSIST · JA / EN') + '</div></div></div>' +
       '<a class="icon-btn" href="#/settings" aria-label="設定">' + icon('gear', 22, '#fff') + '</a>' +
-      '</header>';
-    if (S.swWaiting) {
-      html += '<button class="update" data-act="sw-update">新しい版があります — タップして更新</button>';
+      '</header>' + drillStrip();
+    if (S.drillExpired) {
+      html += '<div class="expired" role="status">訓練モードを始めてから3時間たったため、自動で本番に戻しました。</div>';
     }
+    html += modeSwitch();
     html += '<div class="ready tone-' + r.tone + '"><span class="ready-ic">' +
       icon(r.tone === 'ok' ? 'check' : 'alert', 18) + '</span><div><div class="ready-t">' + esc(r.title) +
       '</div><div class="ready-s">' + esc(r.sub) + '</div></div></div>';
@@ -285,16 +356,18 @@
     var miss = missingVoice(needJa, needEn);
     var ready = (!p.floor || !!st.floor) && !miss;
     var fl2 = floorInfo(st.floor);
-    var label = miss ? miss : (p.floor && !st.floor ? '階を選んでください' : (fl2 ? fl2.ja + 'で放送開始' : '放送開始'));
+    var label = miss ? miss : (p.floor && !st.floor ? '階を選んでください' :
+      (isDrill() ? '【訓練】' : '') + (fl2 ? fl2.ja + 'で放送開始' : '放送開始'));
     html += '<button type="button" class="go tone-' + p.tone + '" data-act="start" ' + (ready ? '' : 'disabled') + '>' +
       icon('play', 22, '#fff') + esc(label) + '</button>';
-    html += '<div class="seq">' + segs.map(function (s) { return esc(s.label); }).join(' → ') +
-      (st.repeat > 1 ? '　× ' + st.repeat + '回' : '') + '</div>';
+
+    var all = drillSegs('start').concat(segs, drillEnd(segs));
+    html += '<div class="seq">' + seqLabel(segs, st.repeat) + '</div>';
 
     html += '<details class="preview"><summary>放送内容を確認</summary>';
-    segs.forEach(function (s) {
+    all.forEach(function (s) {
       if (s.type === 'speech') {
-        html += '<div class="pv"><span class="pv-l">' + esc(s.label) + '</span><p lang="' + s.lang + '">' + esc(s.text) + '</p></div>';
+        html += '<div class="pv' + (s.drill ? ' is-drill' : '') + '"><span class="pv-l">' + esc(s.label) + '</span><p lang="' + s.lang + '">' + esc(s.text) + '</p></div>';
       }
     });
     html += '</details>';
@@ -303,13 +376,22 @@
     html += '</main>';
     app.innerHTML = html;
   }
+  function drillEnd() { return drillSegs('end'); }
+  function seqLabel(segs, repeat) {
+    var sounds = segs.filter(function (s) { return s.type === 'sound'; }).map(function (s) { return s.label; });
+    var speech = segs.filter(function (s) { return s.type !== 'sound'; }).map(function (s) { return s.label; }).join(' → ');
+    if (repeat > 1) speech = '［' + speech + '］× ' + repeat + '回';
+    var parts = sounds.concat(isDrill() ? ['訓練（開始）'] : [], [speech], isDrill() ? ['訓練（終了）'] : []);
+    return esc(parts.join(' → '));
+  }
 
   /* ---------- 手動読み上げ ---------- */
   function renderManual(id, floor) {
     var p = patternById(id);
     if (!p) return go('#/');
     var st = setupFor(p);
-    var segs = resolveSegments(p, st, floor).filter(function (s) { return s.type === 'speech'; });
+    var body = resolveSegments(p, st, floor).filter(function (s) { return s.type === 'speech'; });
+    var segs = drillSegs('start').concat(body, drillSegs('end'));
     if (S.manualStep >= segs.length) S.manualStep = 0;
     var fl = floorInfo(floor || st.floor);
     var html = header('手動読み上げ', p.id, p.tone) + '<main class="pad">';
@@ -321,12 +403,13 @@
     html += '</div>';
     html += langSelector();
     html += '<div class="tip">放送設備のマイクで、この文をそのまま読んでください。「／」で一呼吸。英語はカタカナを、ゆっくり・はっきり。' +
+      (isDrill() ? '<br><b>訓練モード：最初と最後の「訓練」の文も必ず読んでください。</b>' : '') +
       (p.floor && !fl ? '<br><b>階数が未選択のため「〇〇階」と表示しています。</b>' : '') + '</div>';
 
     html += '<div class="tabs" role="tablist">';
     segs.forEach(function (s, i) {
-      html += '<button type="button" role="tab" data-act="mstep" data-v="' + i + '" class="' + (i === S.manualStep ? 'is-on' : '') +
-        '" aria-selected="' + (i === S.manualStep) + '">' + (i + 1) + '. ' + esc(s.label) + '</button>';
+      html += '<button type="button" role="tab" data-act="mstep" data-v="' + i + '" class="' + (s.drill ? 'is-drill ' : '') +
+        (i === S.manualStep ? 'is-on' : '') + '" aria-selected="' + (i === S.manualStep) + '">' + (i + 1) + '. ' + esc(s.label) + '</button>';
     });
     html += '</div>';
 
@@ -385,7 +468,7 @@
     html += '</div></div>';
     html += '<div class="error" role="alert" id="cerr">' + esc(c.error) + '</div>';
     html += '<div class="two"><button type="button" class="ghost" data-act="ctest">' + icon('ear', 18) + '試聴</button>' +
-      '<button type="button" class="go tone-dark" data-act="cstart">' + icon('play', 20, '#fff') + '放送開始</button></div>';
+      '<button type="button" class="go tone-dark" data-act="cstart">' + icon('play', 20, '#fff') + (isDrill() ? '【訓練】' : '') + '放送開始</button></div>';
     html += '</main>';
     app.innerHTML = html;
   }
@@ -429,7 +512,7 @@
       '<li>機内モードにしてアプリを起動し、読み上げできることを確認する</li>' +
       '<li>放送設備（マイクまたは外部入力）を通して館内で聞き取れる音量か確認する</li></ol></details>';
     html += '<button type="button" class="ghost wide" data-act="refresh">最新の版を読み込み直す</button>';
-    html += '<p class="foot-note">アプリ ' + APP_VERSION + ' ／ 文言データ ' + esc(S.data.version) + ' 版<br>' + esc(S.data.source) + '</p>';
+    html += '<p class="foot-note">アプリ v' + APP_VERSION + ' ／ 文言データ ' + esc(S.data.version) + ' 版<br>' + esc(S.data.source) + '</p>';
     html += '</main>';
     app.innerHTML = html;
   }
@@ -441,6 +524,7 @@
     S.playing = {
       title: title, sub: sub, steps: steps, idx: 0, sentence: -1, sentences: [],
       startedAt: Date.now(), done: false, manualHref: manualHref,
+      drill: !!opts.drill,
       loops: steps.reduce(function (m, s) { return Math.max(m, (s.loop || 0) + 1); }, 1),
       again: opts.again
     };
@@ -465,6 +549,7 @@
     releaseWake();
     overlay.hidden = true;
     overlay.innerHTML = '';
+    overlay.classList.remove('is-drill');
     document.body.classList.remove('is-onair');
     if (S.pendingReload) { S.pendingReload = false; location.reload(); }
   }
@@ -476,12 +561,14 @@
     var P = S.playing;
     if (!P) return;
     overlay.hidden = false;
+    overlay.classList.toggle('is-drill', P.drill);
     document.body.classList.add('is-onair');
     var step = P.steps[P.idx] || {};
     var loop = (step.loop || 0);
     var inLoop = P.steps.filter(function (s) { return (s.loop || 0) === loop && s.kind !== 'pause'; });
+    var pill = P.done ? '放送終了' : (P.drill ? '訓練放送中　DRILL' : '放送中　ON AIR');
     var html = '<div class="oa-head">' +
-      '<div class="oa-pill ' + (P.done ? 'is-done' : '') + '"><span class="dot"></span>' + (P.done ? '放送終了' : '放送中　ON AIR') + '</div>' +
+      '<div class="oa-pill ' + (P.done ? 'is-done' : (P.drill ? 'is-drill' : '')) + '"><span class="dot"></span>' + pill + '</div>' +
       '<span class="oa-time" id="oatime">' + fmt(Date.now() - P.startedAt) + '</span></div>' +
       '<div class="oa-title"><b>' + esc(P.title) + '</b><span>' + (P.loops > 1 ? (loop + 1) + ' / ' + P.loops + ' 回目' : '') + '</span></div>' +
       (P.sub ? '<div class="oa-sub">' + esc(P.sub) + '</div>' : '');
@@ -495,7 +582,7 @@
 
     html += '<section class="oa-card">';
     if (P.done) {
-      html += '<p class="oa-text">放送が終わりました。</p>';
+      html += '<p class="oa-text">' + (P.drill ? '訓練放送が終わりました。' : '放送が終わりました。') + '</p>';
     } else if (step.kind === 'speech') {
       html += '<div class="oa-cap">いま流れている文（窓口で画面を見せても可）</div><p class="oa-text" lang="' + step.lang + '">';
       P.sentences.forEach(function (t, k) {
@@ -512,7 +599,7 @@
     html += '</section>';
 
     html += '<div class="oa-chips"><span>' + (S.wakeLock ? '画面スリープ防止中' : '再生中は画面を消さないでください') + '</span>' +
-      '<span>端末の読み上げ音声</span></div>';
+      '<span>端末の読み上げ音声</span>' + (P.drill ? '<span>訓練モード</span>' : '') + '</div>';
     html += '<div class="oa-grow"></div><div class="oa-actions">';
     if (P.done) {
       html += '<div class="two">' + (P.again ? '<button type="button" class="ghost-dark" data-act="again">もう一度流す</button>' : '') +
@@ -529,6 +616,8 @@
       var el = document.getElementById('oatime');
       if (el) el.textContent = fmt(Date.now() - S.playing.startedAt);
     }
+    // 訓練モードの自動解除（放送中は解除しない）
+    if (S.drill && !S.playing && Date.now() - S.drillSince > DRILL_TIMEOUT_MS) { isDrill(); render(); }
   }, 500);
 
   function requestWake() {
@@ -559,6 +648,7 @@
     var p = r.id ? patternById(r.id) : null;
 
     switch (act) {
+      case 'mode': setDrill(v === 'drill'); render(); break;
       case 'lang': S.settings.lang = v; saveSettings(); render(); break;
       case 'floor': setupFor(p).floor = v; renderPattern(p.id); break;
       case 'repeat': setupFor(p).repeat = parseInt(v, 10); renderPattern(p.id); break;
@@ -572,10 +662,11 @@
           sub = '避難：' + fl.ja + (ab ? '・' + floorInfo(ab).ja : '') + (st.opts.standby ? '　／　その他の階：待機' : '');
         }
         sub = (sub ? sub + '　／　' : '') + langLabel();
-        var title = p.id + ' ' + p.title;
+        var drill = isDrill();
+        var title = (drill ? '【訓練】' : '') + p.id + ' ' + p.title;
         var steps = buildSteps(resolveSegments(p, st), st.repeat);
         var href = '#/manual/' + p.id + (st.floor ? '/' + st.floor : '');
-        var run = function () { startPlayback(title, sub, steps, href, { again: run }); };
+        var run = function () { startPlayback(title, sub, steps, href, { again: run, drill: drill }); };
         run();
         break;
       }
@@ -604,9 +695,11 @@
           if (langMode() !== 'en') steps2.push({ kind: 'speech', lang: 'ja', text: c2.ja.trim(), label: '日本語', loop: i });
           if (langMode() !== 'ja') steps2.push({ kind: 'speech', lang: 'en', text: c2.en.trim(), label: 'English', loop: i });
         }
-        var ttl = test ? '臨時放送（試聴）' : '臨時放送';
-        var csub = test ? '放送設備につなぐ前に端末で確認' : '';
-        var run2 = function () { startPlayback(ttl, csub, steps2, null, { again: run2 }); };
+        var drill2 = isDrill() && !test;
+        if (drill2) steps2 = wrapDrill(steps2);
+        var ttl = test ? '臨時放送（試聴）' : (drill2 ? '【訓練】臨時放送' : '臨時放送');
+        var csub = test ? '放送設備につなぐ前に端末で確認' : langLabel();
+        var run2 = function () { startPlayback(ttl, csub, steps2, null, { again: run2, drill: drill2 }); };
         run2();
         break;
       }
@@ -615,7 +708,6 @@
       case 'tchime': SP.chime(); break;
       case 'tsiren': SP.siren(); break;
       case 'refresh': refreshApp(); break;
-      case 'sw-update': applySwUpdate(); break;
       case 'stop': stopPlayback(); break;
       case 'close': stopPlayback(); break;
       case 'again': { var a = S.playing && S.playing.again; stopPlayback(); if (a) a(); break; }
@@ -666,6 +758,7 @@
     // ホームから入り直したときは階数を必ず選び直させる（前回の階で誤放送しないため）
     if (S.route.name === 'pattern' && prev.name === 'home' && S.setup[S.route.id]) S.setup[S.route.id].floor = null;
     if (S.route.name === 'manual' && (prev.name !== 'manual' || prev.id !== S.route.id)) S.manualStep = 0;
+    if (S.route.name !== 'home') S.drillExpired = false;
     render();
     window.scrollTo(0, 0);
   }
@@ -679,7 +772,7 @@
     var hadController = !!navigator.serviceWorker.controller;
     var refreshing = false;
     navigator.serviceWorker.addEventListener('controllerchange', function () {
-      if (!hadController) { hadController = true; if (S.route.name === 'home') renderHome(); return; }
+      if (!hadController) { hadController = true; if (S.route.name === 'home' && S.data) renderHome(); return; }
       if (refreshing) return;
       if (S.playing) { S.pendingReload = true; return; }
       refreshing = true;
@@ -692,7 +785,6 @@
       });
     }).catch(function () { /* file:// 等では登録できない */ });
   }
-  function applySwUpdate() { location.reload(); }
   function refreshApp() {
     if (!('serviceWorker' in navigator)) return location.reload();
     navigator.serviceWorker.getRegistration().then(function (reg) {
@@ -704,10 +796,11 @@
 
   /* ---------- 起動 ---------- */
   function boot() {
+    applyModeClass();
     document.addEventListener('click', onClick);
     document.addEventListener('input', onInput);
     document.addEventListener('change', onInput);
-    SP.onVoicesChanged(function () { if (S.route.name === 'home' || S.route.name === 'settings') render(); });
+    SP.onVoicesChanged(function () { if (S.data && (S.route.name === 'home' || S.route.name === 'settings')) render(); });
 
     fetch('./data/announcements.json', { cache: 'no-cache' })
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })

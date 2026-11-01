@@ -1,8 +1,8 @@
 /* オフライン用 Service Worker
- * 文言や画面を更新したら CACHE の版番号を上げてください（例：v1.1.3）。
+ * 文言や画面を更新したら CACHE の版番号を上げてください（例：v1.2.1）。
  * 版番号が変わると、各端末は次に開いたとき自動で最新版に入れ替わります。
  */
-var CACHE = 'pa-assist-v1.1.2';
+var CACHE = 'pa-assist-v1.2.0';
 var FONT_CACHE = 'pa-assist-fonts';
 var SHELL = [
   './',
