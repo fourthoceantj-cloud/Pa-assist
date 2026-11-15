@@ -3,7 +3,9 @@
   'use strict';
 
   var SP = window.PA_SPEECH;
-  var APP_VERSION = '1.2.0';
+  var APP_VERSION = '1.3.0';
+  /* インターホン一斉放送の1回あたりの上限（令和8年11月の訓練で確認） */
+  var IC_LIMIT_MS = 30 * 1000;
   var SETTINGS_KEY = 'pa-assist-settings-v1';
   /* 訓練モードの自動解除までの時間（訓練モードのまま本番を迎えないため） */
   var DRILL_TIMEOUT_MS = 3 * 60 * 60 * 1000;
@@ -34,7 +36,7 @@
     });
   }
   function loadSettings() {
-    var def = { jaVoice: '', enVoice: '', rate: 0.9, lang: 'both' };
+    var def = { jaVoice: '', enVoice: '', rate: 0.9, lang: 'both', target: 'pa' };
     try {
       var raw = localStorage.getItem(SETTINGS_KEY);
       if (raw) { var o = JSON.parse(raw); for (var k in o) def[k] = o[k]; }
@@ -98,6 +100,73 @@
     });
     return h + '</div></div>';
   }
+  /* ---------- 放送する設備（非常放送／インターホン一斉） ---------- */
+  var TARGETS = [
+    { id: 'pa', label: '非常放送（全館）', sub: '非常・業務放送盤のマイク' },
+    { id: 'ic', label: 'インターホン一斉', sub: '1回30秒まで・短縮版' }
+  ];
+  function icMode(p) { return S.settings.target === 'ic' && !!(p ? p.intercom : true); }
+  function targetSelector(p) {
+    if (!p || !p.intercom) return '';
+    var m = icMode(p) ? 'ic' : 'pa';
+    var h = '<div class="lang target"><span class="lang-l">放送する設備</span><div class="lang-seg" role="group" aria-label="放送する設備">';
+    TARGETS.forEach(function (t) {
+      h += '<button type="button" data-act="target" data-v="' + t.id + '" class="' + (m === t.id ? 'is-on' : '') +
+        '" aria-pressed="' + (m === t.id) + '">' + esc(t.label) + '<small>' + esc(t.sub) + '</small></button>';
+    });
+    h += '</div></div>';
+    if (m === 'ic') {
+      h += '<div class="tip">インターホンの一斉放送は1回30秒までです。短縮版を1件ずつ流します。<b>1件ごとに、インターホンの一斉放送ボタンを押してから「流す」をタップ</b>してください。</div>';
+    } else {
+      h += '<div class="tip">非常放送が住戸内で聞こえないことが訓練で分かっています。全館放送のあと、「インターホン一斉」に切り替えて同じ内容を流してください。</div>';
+    }
+    return h;
+  }
+  /* インターホン用の短縮版（1件＝1回分の一斉放送） */
+  function resolveParts(p, st, floorOverride) {
+    if (!p.intercom) return [];
+    var fid = floorOverride || st.floor;
+    var fl = floorInfo(fid);
+    var abId = p.floor === 'fireAndAbove' && fid ? aboveOf(fid) : null;
+    var ab = floorInfo(abId);
+    var noAbove = p.floor === 'fireAndAbove' && fid && !abId;
+    return p.intercom.parts.filter(function (x) {
+      if (x.option && !st.opts[x.option]) return false;
+      return langOk(x.lang);
+    }).map(function (x) {
+      var t = noAbove && x.textNoAbove ? x.textNoAbove : x.text;
+      var k = noAbove && x.kanaNoAbove ? x.kanaNoAbove : x.kana;
+      return { type: 'speech', id: x.id, lang: x.lang, label: x.label, text: fill(t, fl, ab), kana: fill(k, fl, ab) };
+    });
+  }
+  /* 読み上げ時間の目安（秒）。端末の音声で多少前後する */
+  function estSec(text, lang) {
+    var r = S.settings.rate || 0.9;
+    if (lang === 'ja') {
+      var n = text.replace(/[、。・「」（）\s]/g, '').length;
+      var stops = (text.match(/[。、]/g) || []).length;
+      return Math.round(n / (7.0 * r) + stops * 0.35 + 1);
+    }
+    var w = text.split(/\s+/).filter(Boolean).length;
+    var st2 = (text.match(/[.,:;]/g) || []).length;
+    return Math.round(w / (2.5 * r) + st2 * 0.3 + 1);
+  }
+  function icDrillSeg(lang) {
+    if (!isDrill() || !S.data.drill || !S.data.drill.intercom) return null;
+    return S.data.drill.intercom.filter(function (d) { return d.lang === lang; })[0] || null;
+  }
+  function partSec(part) {
+    var d = icDrillSeg(part.lang);
+    return estSec(part.text, part.lang) + (d ? estSec(d.text, d.lang) : 0);
+  }
+  function partSteps(part) {
+    var d = icDrillSeg(part.lang);
+    var steps = [];
+    if (d) steps.push({ kind: 'speech', lang: d.lang, text: d.text, label: d.label, loop: 0, drill: true });
+    steps.push({ kind: 'speech', lang: part.lang, text: part.text, label: part.label, loop: 0 });
+    return steps;
+  }
+
   /* 選んだ言語の音声が端末にない場合の案内（なければ空） */
   function missingVoice(needJa, needEn) {
     if (!SP.supported()) return 'この端末は読み上げに対応していません';
@@ -310,6 +379,7 @@
     if (!p) return go('#/');
     var st = setupFor(p);
     var html = header(p.title, p.id, p.tone) + '<main class="pad">';
+    html += targetSelector(p);
     html += langSelector();
 
     if (p.floor) {
@@ -350,6 +420,7 @@
     });
     html += '</div></div>';
 
+    if (icMode(p)) { html += icPatternBody(p, st); html += '</main>'; app.innerHTML = html; return; }
     var segs = resolveSegments(p, st);
     var needJa = segs.some(function (x) { return x.lang === 'ja'; });
     var needEn = segs.some(function (x) { return x.lang === 'en'; });
@@ -376,6 +447,46 @@
     html += '</main>';
     app.innerHTML = html;
   }
+  /* インターホン一斉：短縮版の一覧と開始ボタン */
+  function icPatternBody(p, st) {
+    var parts = resolveParts(p, st);
+    var html = '';
+    var needJa = parts.some(function (x) { return x.lang === 'ja'; });
+    var needEn = parts.some(function (x) { return x.lang === 'en'; });
+    var miss = missingVoice(needJa, needEn);
+    var ready = (!p.floor || !!st.floor) && !miss && parts.length > 0;
+    var fl = floorInfo(st.floor);
+    var label = miss ? miss : (p.floor && !st.floor ? '階を選んでください' :
+      (isDrill() ? '【訓練】' : '') + 'インターホンで放送　' + parts.length + '件' + (st.repeat > 1 ? '×' + st.repeat + '回' : ''));
+    html += '<button type="button" class="go tone-' + p.tone + '" data-act="icstart" ' + (ready ? '' : 'disabled') + '>' +
+      icon('play', 22, '#fff') + esc(label) + '</button>';
+    html += '<div class="ic-list">';
+    parts.forEach(function (x, i) {
+      var sec = partSec(x);
+      var over = sec > 27;
+      html += '<div class="pv ic-part' + (over ? ' is-over' : '') + '"><span class="pv-l">' + (i + 1) + '. ' + esc(x.label) +
+        '　<em>約' + sec + '秒' + (over ? '　※30秒を超えるおそれ（速さを上げる／手動で読む）' : '') + '</em></span>' +
+        '<p lang="' + x.lang + '">' + esc(x.text) + '</p></div>';
+    });
+    html += '</div>';
+    if (isDrill()) html += '<div class="tip">訓練モード：各回の最初に「訓練放送です。」が入ります（30秒に収めるため、終わりの文は入りません）。</div>';
+    html += '<a class="sub-link" href="#/manual/' + p.id + (st.floor ? '/' + st.floor : '') + '">' + icon('mic', 18) +
+      '音が出ないとき：手動読み上げ（インターホンの受話器で読む）</a>';
+    return html;
+  }
+  function icPlayPart() {
+    var R2 = S.icRun;
+    if (!R2) return;
+    var part = R2.parts[R2.idx];
+    var total = R2.parts.length * R2.cycles;
+    var n = R2.cycle * R2.parts.length + R2.idx + 1;
+    var nextPart = R2.idx + 1 < R2.parts.length ? R2.parts[R2.idx + 1] : (R2.cycle + 1 < R2.cycles ? R2.parts[0] : null);
+    var title = (R2.drill ? '【訓練】' : '') + R2.p.id + ' インターホン一斉 ' + n + ' / ' + total;
+    startPlayback(title, part.label + '　／　' + R2.sub, partSteps(part), R2.href, {
+      drill: R2.drill, again: icPlayPart,
+      ic: { label: part.label, next: nextPart ? nextPart.label : '' }
+    });
+  }
   function drillEnd() { return drillSegs('end'); }
   function seqLabel(segs, repeat) {
     var sounds = segs.filter(function (s) { return s.type === 'sound'; }).map(function (s) { return s.label; });
@@ -390,8 +501,9 @@
     var p = patternById(id);
     if (!p) return go('#/');
     var st = setupFor(p);
-    var body = resolveSegments(p, st, floor).filter(function (s) { return s.type === 'speech'; });
-    var segs = drillSegs('start').concat(body, drillSegs('end'));
+    var ic = icMode(p);
+    var body = ic ? resolveParts(p, st, floor) : resolveSegments(p, st, floor).filter(function (s) { return s.type === 'speech'; });
+    var segs = ic ? body : drillSegs('start').concat(body, drillSegs('end'));
     if (S.manualStep >= segs.length) S.manualStep = 0;
     var fl = floorInfo(floor || st.floor);
     var html = header('手動読み上げ', p.id, p.tone) + '<main class="pad">';
@@ -401,8 +513,9 @@
       html += '<a class="' + (q.id === p.id ? 'is-on' : '') + '" href="#/manual/' + q.id + '">' + q.id + '</a>';
     });
     html += '</div>';
+    html += targetSelector(p);
     html += langSelector();
-    html += '<div class="tip">放送設備のマイクで、この文をそのまま読んでください。「／」で一呼吸。英語はカタカナを、ゆっくり・はっきり。' +
+    html += '<div class="tip">' + (ic ? 'インターホンの一斉放送で、1件ずつ（各30秒以内）読んでください。' + (isDrill() ? '各回の最初に「訓練放送です。」と言ってください。' : '') + '<br>' : '') + '放送設備のマイクで、この文をそのまま読んでください。「／」で一呼吸。英語はカタカナを、ゆっくり・はっきり。' +
       (isDrill() ? '<br><b>訓練モード：最初と最後の「訓練」の文も必ず読んでください。</b>' : '') +
       (p.floor && !fl ? '<br><b>階数が未選択のため「〇〇階」と表示しています。</b>' : '') + '</div>';
 
@@ -510,7 +623,8 @@
       '<li>上の4つのテストがすべて聞こえる</li>' +
       '<li>マナーモード（消音スイッチ）ONでも聞こえるか確認する</li>' +
       '<li>機内モードにしてアプリを起動し、読み上げできることを確認する</li>' +
-      '<li>放送設備（マイクまたは外部入力）を通して館内で聞き取れる音量か確認する</li></ol></details>';
+      '<li>放送設備（マイクまたは外部入力）を通して館内で聞き取れる音量か確認する</li>' +
+      '<li>インターホンの一斉放送でも流し、住戸内で聞き取れること、1件が30秒以内に収まることを確認する</li></ol></details>';
     html += '<button type="button" class="ghost wide" data-act="refresh">最新の版を読み込み直す</button>';
     html += '<p class="foot-note">アプリ v' + APP_VERSION + ' ／ 文言データ ' + esc(S.data.version) + ' 版<br>' + esc(S.data.source) + '</p>';
     html += '</main>';
@@ -525,6 +639,7 @@
       title: title, sub: sub, steps: steps, idx: 0, sentence: -1, sentences: [],
       startedAt: Date.now(), done: false, manualHref: manualHref,
       drill: !!opts.drill,
+      ic: opts.ic || null,
       loops: steps.reduce(function (m, s) { return Math.max(m, (s.loop || 0) + 1); }, 1),
       again: opts.again
     };
@@ -557,6 +672,11 @@
     var s = Math.floor(ms / 1000);
     return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
   }
+  function oaTime(P) {
+    if (!P.ic) return fmt(Date.now() - P.startedAt);
+    var left = Math.ceil((IC_LIMIT_MS - (Date.now() - P.startedAt)) / 1000);
+    return left > 0 ? '残り ' + left + ' 秒' : '30秒超過';
+  }
   function renderOnAir() {
     var P = S.playing;
     if (!P) return;
@@ -569,7 +689,7 @@
     var pill = P.done ? '放送終了' : (P.drill ? '訓練放送中　DRILL' : '放送中　ON AIR');
     var html = '<div class="oa-head">' +
       '<div class="oa-pill ' + (P.done ? 'is-done' : (P.drill ? 'is-drill' : '')) + '"><span class="dot"></span>' + pill + '</div>' +
-      '<span class="oa-time" id="oatime">' + fmt(Date.now() - P.startedAt) + '</span></div>' +
+      '<span class="oa-time' + (P.ic ? ' is-ic' : '') + '" id="oatime">' + oaTime(P) + '</span></div>' +
       '<div class="oa-title"><b>' + esc(P.title) + '</b><span>' + (P.loops > 1 ? (loop + 1) + ' / ' + P.loops + ' 回目' : '') + '</span></div>' +
       (P.sub ? '<div class="oa-sub">' + esc(P.sub) + '</div>' : '');
     html += '<div class="oa-steps">';
@@ -581,7 +701,11 @@
     html += '</div>';
 
     html += '<section class="oa-card">';
-    if (P.done) {
+    if (P.done && P.ic) {
+      html += '<p class="oa-text">「' + esc(P.ic.label) + '」を流しました。</p>' +
+        (P.ic.next ? '<div class="oa-next"><span>次：</span>' + esc(P.ic.next) + '<br>インターホンの一斉放送ボタンを押してから、下の「次を流す」をタップ</div>'
+          : '<div class="oa-next">すべて流し終えました。</div>');
+    } else if (P.done) {
       html += '<p class="oa-text">' + (P.drill ? '訓練放送が終わりました。' : '放送が終わりました。') + '</p>';
     } else if (step.kind === 'speech') {
       html += '<div class="oa-cap">いま流れている文（窓口で画面を見せても可）</div><p class="oa-text" lang="' + step.lang + '">';
@@ -601,7 +725,11 @@
     html += '<div class="oa-chips"><span>' + (S.wakeLock ? '画面スリープ防止中' : '再生中は画面を消さないでください') + '</span>' +
       '<span>端末の読み上げ音声</span>' + (P.drill ? '<span>訓練モード</span>' : '') + '</div>';
     html += '<div class="oa-grow"></div><div class="oa-actions">';
-    if (P.done) {
+    if (P.done && P.ic && P.ic.next) {
+      html += '<button type="button" class="stop" data-act="icnext">' + icon('play', 26, '#fff') + '次を流す（' + esc(P.ic.next) + '）</button>' +
+        '<div class="two"><button type="button" class="ghost-dark" data-act="again">今の分をもう一度</button>' +
+        '<button type="button" class="close" data-act="icend">中止して閉じる</button></div>';
+    } else if (P.done) {
       html += '<div class="two">' + (P.again ? '<button type="button" class="ghost-dark" data-act="again">もう一度流す</button>' : '') +
         '<button type="button" class="close" data-act="close">閉じる</button></div>';
     } else {
@@ -614,7 +742,10 @@
   setInterval(function () {
     if (S.playing && !S.playing.done) {
       var el = document.getElementById('oatime');
-      if (el) el.textContent = fmt(Date.now() - S.playing.startedAt);
+      if (el) {
+        el.textContent = oaTime(S.playing);
+        el.classList.toggle('is-warn', !!S.playing.ic && Date.now() - S.playing.startedAt > IC_LIMIT_MS - 5000);
+      }
     }
     // 訓練モードの自動解除（放送中は解除しない）
     if (S.drill && !S.playing && Date.now() - S.drillSince > DRILL_TIMEOUT_MS) { isDrill(); render(); }
@@ -650,6 +781,32 @@
     switch (act) {
       case 'mode': setDrill(v === 'drill'); render(); break;
       case 'lang': S.settings.lang = v; saveSettings(); render(); break;
+      case 'target': S.settings.target = v; saveSettings(); S.manualStep = 0; render(); break;
+      case 'icstart': {
+        var sti = setupFor(p);
+        if (p.floor && !sti.floor) return;
+        var parts = resolveParts(p, sti);
+        if (!parts.length) return;
+        var fli = floorInfo(sti.floor);
+        S.icRun = {
+          p: p, parts: parts, idx: 0, cycle: 0, cycles: sti.repeat, drill: isDrill(),
+          sub: (fli ? fli.ja + '　／　' : '') + langLabel(),
+          href: '#/manual/' + p.id + (sti.floor ? '/' + sti.floor : '')
+        };
+        icPlayPart();
+        break;
+      }
+      case 'icnext': {
+        var R3 = S.icRun;
+        if (!R3) break;
+        stopPlayback();
+        R3.idx++;
+        if (R3.idx >= R3.parts.length) { R3.idx = 0; R3.cycle++; }
+        if (R3.cycle >= R3.cycles) { S.icRun = null; break; }
+        icPlayPart();
+        break;
+      }
+      case 'icend': S.icRun = null; stopPlayback(); break;
       case 'floor': setupFor(p).floor = v; renderPattern(p.id); break;
       case 'repeat': setupFor(p).repeat = parseInt(v, 10); renderPattern(p.id); break;
       case 'start': {
@@ -703,13 +860,13 @@
         run2();
         break;
       }
-      case 'tja': startPlayback('日本語テスト', '', [{ kind: 'speech', lang: 'ja', text: 'こちらは１階管理室です。これは放送のテストです。', label: '日本語' }], null); break;
+      case 'tja': startPlayback('日本語テスト', '', [{ kind: 'speech', lang: 'ja', text: 'こちらは１階管理事務室です。これは放送のテストです。', label: '日本語' }], null); break;
       case 'ten': startPlayback('英語テスト', '', [{ kind: 'speech', lang: 'en', text: 'This is the management office. This is a test announcement.', label: 'English' }], null); break;
       case 'tchime': SP.chime(); break;
       case 'tsiren': SP.siren(); break;
       case 'refresh': refreshApp(); break;
-      case 'stop': stopPlayback(); break;
-      case 'close': stopPlayback(); break;
+      case 'stop': S.icRun = null; stopPlayback(); break;
+      case 'close': S.icRun = null; stopPlayback(); break;
       case 'again': { var a = S.playing && S.playing.again; stopPlayback(); if (a) a(); break; }
       case 'tomanual': { var h = S.playing.manualHref; stopPlayback(); S.manualStep = 0; go(h); break; }
     }
