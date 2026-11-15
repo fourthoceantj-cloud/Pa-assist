@@ -1,0 +1,979 @@
+/* 館内放送アシスト — 画面と操作 */
+(function () {
+  'use strict';
+
+  var SP = window.PA_SPEECH;
+  var APP_VERSION = '1.3.0';
+  /* インターホン一斉放送の1回あたりの上限（令和8年11月の訓練で確認） */
+  var IC_LIMIT_MS = 30 * 1000;
+  var SETTINGS_KEY = 'pa-assist-settings-v1';
+  /* 訓練モードの自動解除までの時間（訓練モードのまま本番を迎えないため） */
+  var DRILL_TIMEOUT_MS = 3 * 60 * 60 * 1000;
+
+  var S = {
+    data: null,
+    route: { name: 'home' },
+    setup: {},
+    custom: null,
+    manualStep: 0,
+    settings: loadSettings(),
+    playing: null,
+    wakeLock: null,
+    pendingReload: false,
+    /* 訓練モードは端末に保存しない：アプリを開き直すと必ず「本番」から始まる */
+    drill: false,
+    drillSince: 0,
+    drillExpired: false
+  };
+
+  var app = document.getElementById('app');
+  var overlay = document.getElementById('onair');
+
+  /* ---------- 小道具 ---------- */
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function loadSettings() {
+    var def = { jaVoice: '', enVoice: '', rate: 0.9, lang: 'both', target: 'pa' };
+    try {
+      var raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) { var o = JSON.parse(raw); for (var k in o) def[k] = o[k]; }
+    } catch (e) { /* 保存できない端末でも動く */ }
+    return def;
+  }
+  function saveSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(S.settings)); } catch (e) { /* noop */ }
+  }
+  function ord(n) {
+    var s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+    return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+  function floorInfo(f) {
+    if (!f) return null;
+    var base = f.charAt(0) === 'B';
+    return {
+      id: f,
+      ja: base ? '地下' + f.slice(1) + '階' : f + '階',
+      en: base ? 'basement level ' + f.slice(1) : ord(parseInt(f, 10)) + ' floor',
+      kana: S.data.floors.kana[f] || f
+    };
+  }
+  function aboveOf(f) {
+    var list = S.data.floors.list;
+    var i = list.indexOf(f);
+    return i >= 0 && i < list.length - 1 ? list[i + 1] : null;
+  }
+  function fill(text, fl, ab) {
+    if (!text) return '';
+    return text
+      .replace(/\{floor_(ja|en|kana)\}/g, function (m, k) { return fl ? fl[k] : '〇〇階'; })
+      .replace(/\{above_(ja|en|kana)\}/g, function (m, k) { return ab ? ab[k] : '〇〇階'; });
+  }
+  function patternById(id) {
+    return S.data.patterns.filter(function (p) { return p.id === id; })[0];
+  }
+
+  /* ---------- 言語 ---------- */
+  var LANGS = [
+    { id: 'ja', label: '日本語のみ' },
+    { id: 'en', label: '英語のみ' },
+    { id: 'both', label: '日本語→英語' }
+  ];
+  function langMode() { var m = S.settings.lang; return m === 'ja' || m === 'en' ? m : 'both'; }
+  function langLabel(m) { return LANGS.filter(function (l) { return l.id === (m || langMode()); })[0].label; }
+  function langOk(segLang) {
+    var m = langMode();
+    return m === 'both' || segLang === m;
+  }
+  /* 選んだ言語では流れる文がない選択肢（例：英語のみのときの役員招集）は画面に出さない */
+  function optionVisible(p, o) {
+    return p.segments.some(function (s) { return s.option === o.id && langOk(s.lang); });
+  }
+  function langSelector() {
+    var m = langMode();
+    var h = '<div class="lang"><span class="lang-l">放送する言語</span><div class="lang-seg" role="group" aria-label="放送する言語">';
+    LANGS.forEach(function (l) {
+      h += '<button type="button" data-act="lang" data-v="' + l.id + '" class="' + (m === l.id ? 'is-on' : '') +
+        '" aria-pressed="' + (m === l.id) + '">' + esc(l.label) + '</button>';
+    });
+    return h + '</div></div>';
+  }
+  /* ---------- 放送する設備（非常放送／インターホン一斉） ---------- */
+  var TARGETS = [
+    { id: 'pa', label: '非常放送（全館）', sub: '非常・業務放送盤のマイク' },
+    { id: 'ic', label: 'インターホン一斉', sub: '1回30秒まで・短縮版' }
+  ];
+  function icMode(p) { return S.settings.target === 'ic' && !!(p ? p.intercom : true); }
+  function targetSelector(p) {
+    if (!p || !p.intercom) return '';
+    var m = icMode(p) ? 'ic' : 'pa';
+    var h = '<div class="lang target"><span class="lang-l">放送する設備</span><div class="lang-seg" role="group" aria-label="放送する設備">';
+    TARGETS.forEach(function (t) {
+      h += '<button type="button" data-act="target" data-v="' + t.id + '" class="' + (m === t.id ? 'is-on' : '') +
+        '" aria-pressed="' + (m === t.id) + '">' + esc(t.label) + '<small>' + esc(t.sub) + '</small></button>';
+    });
+    h += '</div></div>';
+    if (m === 'ic') {
+      h += '<div class="tip">インターホンの一斉放送は1回30秒までです。短縮版を1件ずつ流します。<b>1件ごとに、インターホンの一斉放送ボタンを押してから「流す」をタップ</b>してください。</div>';
+    } else {
+      h += '<div class="tip">非常放送が住戸内で聞こえないことが訓練で分かっています。全館放送のあと、「インターホン一斉」に切り替えて同じ内容を流してください。</div>';
+    }
+    return h;
+  }
+  /* インターホン用の短縮版（1件＝1回分の一斉放送） */
+  function resolveParts(p, st, floorOverride) {
+    if (!p.intercom) return [];
+    var fid = floorOverride || st.floor;
+    var fl = floorInfo(fid);
+    var abId = p.floor === 'fireAndAbove' && fid ? aboveOf(fid) : null;
+    var ab = floorInfo(abId);
+    var noAbove = p.floor === 'fireAndAbove' && fid && !abId;
+    return p.intercom.parts.filter(function (x) {
+      if (x.option && !st.opts[x.option]) return false;
+      return langOk(x.lang);
+    }).map(function (x) {
+      var t = noAbove && x.textNoAbove ? x.textNoAbove : x.text;
+      var k = noAbove && x.kanaNoAbove ? x.kanaNoAbove : x.kana;
+      return { type: 'speech', id: x.id, lang: x.lang, label: x.label, text: fill(t, fl, ab), kana: fill(k, fl, ab) };
+    });
+  }
+  /* 読み上げ時間の目安（秒）。端末の音声で多少前後する */
+  function estSec(text, lang) {
+    var r = S.settings.rate || 0.9;
+    if (lang === 'ja') {
+      var n = text.replace(/[、。・「」（）\s]/g, '').length;
+      var stops = (text.match(/[。、]/g) || []).length;
+      return Math.round(n / (7.0 * r) + stops * 0.35 + 1);
+    }
+    var w = text.split(/\s+/).filter(Boolean).length;
+    var st2 = (text.match(/[.,:;]/g) || []).length;
+    return Math.round(w / (2.5 * r) + st2 * 0.3 + 1);
+  }
+  function icDrillSeg(lang) {
+    if (!isDrill() || !S.data.drill || !S.data.drill.intercom) return null;
+    return S.data.drill.intercom.filter(function (d) { return d.lang === lang; })[0] || null;
+  }
+  function partSec(part) {
+    var d = icDrillSeg(part.lang);
+    return estSec(part.text, part.lang) + (d ? estSec(d.text, d.lang) : 0);
+  }
+  function partSteps(part) {
+    var d = icDrillSeg(part.lang);
+    var steps = [];
+    if (d) steps.push({ kind: 'speech', lang: d.lang, text: d.text, label: d.label, loop: 0, drill: true });
+    steps.push({ kind: 'speech', lang: part.lang, text: part.text, label: part.label, loop: 0 });
+    return steps;
+  }
+
+  /* 選んだ言語の音声が端末にない場合の案内（なければ空） */
+  function missingVoice(needJa, needEn) {
+    if (!SP.supported()) return 'この端末は読み上げに対応していません';
+    if (!SP.voices().length) return '';
+    var v = currentVoices();
+    if (needJa && !v.ja) return '日本語の音声がありません（設定を確認）';
+    if (needEn && !v.en) return '英語の音声がありません（設定を確認）';
+    return '';
+  }
+  function currentVoices() {
+    return {
+      ja: SP.pickVoice('ja', S.settings.jaVoice),
+      en: SP.pickVoice('en', S.settings.enVoice)
+    };
+  }
+
+  /* ---------- 訓練モード ---------- */
+  function isDrill() {
+    if (S.drill && Date.now() - S.drillSince > DRILL_TIMEOUT_MS) {
+      S.drill = false;
+      S.drillExpired = true;
+      applyModeClass();
+    }
+    return S.drill;
+  }
+  function setDrill(on) {
+    S.drill = !!on;
+    S.drillSince = on ? Date.now() : 0;
+    S.drillExpired = false;
+    applyModeClass();
+  }
+  function applyModeClass() {
+    document.body.classList.toggle('is-drill', S.drill);
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', S.drill ? '#5E3D00' : '#17191E');
+  }
+  /* 訓練の前置き（start）・締め（end）の文。選んだ言語のものだけ */
+  function drillSegs(pos) {
+    if (!isDrill() || !S.data.drill) return [];
+    return (S.data.drill[pos] || []).filter(function (d) { return langOk(d.lang); }).map(function (d) {
+      return { type: 'speech', lang: d.lang, label: d.label, text: d.text, kana: d.kana || '', drill: true };
+    });
+  }
+  function drillStrip() {
+    if (!isDrill()) return '';
+    return '<div class="drill-strip" role="status"><span class="tag">DRILL</span><span>訓練モード</span>' +
+      '<span>放送の最初と最後に「これは訓練です」が入ります</span></div>';
+  }
+  /* 放送手順の先頭（チャイム・警報音の直後）と末尾に訓練の文を入れる */
+  function wrapDrill(steps) {
+    if (!isDrill()) return steps;
+    var head = drillSegs('start').map(function (d) { return { kind: 'speech', lang: d.lang, text: d.text, label: d.label, loop: 0, drill: true }; });
+    var tail = drillSegs('end').map(function (d) { return { kind: 'speech', lang: d.lang, text: d.text, label: d.label, loop: lastLoop(steps), drill: true }; });
+    var i = 0;
+    while (i < steps.length && steps[i].kind === 'sound') i++;
+    return steps.slice(0, i).concat(head, steps.slice(i), tail);
+  }
+  function lastLoop(steps) {
+    return steps.reduce(function (m, s) { return Math.max(m, s.loop || 0); }, 0);
+  }
+
+  function icon(name, size, color) {
+    size = size || 20; color = color || 'currentColor';
+    var p = {
+      back: '<path d="m15 6-6 6 6 6"/>',
+      chev: '<path d="m9 6 6 6-6 6"/>',
+      play: '<path d="M7 4.5v15l13-7.5z" fill="' + color + '" stroke="none"/>',
+      stop: '<rect x="4" y="4" width="16" height="16" rx="2" fill="' + color + '" stroke="none"/>',
+      check: '<path d="M20 6 9 17l-5-5"/>',
+      alert: '<path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18v.5"/>',
+      gear: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
+      speaker: '<path d="M3 10v4h4l5 4V6L7 10H3z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M19 6a8 8 0 0 1 0 12"/>',
+      keyboard: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h2M11 9h2M15 9h2M7 13h10"/>',
+      mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+      ear: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><rect x="3" y="14" width="4" height="6" rx="1"/><rect x="17" y="14" width="4" height="6" rx="1"/>',
+      bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/>',
+      flag: '<path d="M4 22V4"/><path d="M4 4h12l-2 4 2 4H4"/>'
+    }[name] || '';
+    return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="' + color +
+      '" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + '</svg>';
+  }
+  function header(title, badge, tone) {
+    return '<header class="bar">' +
+      '<a class="icon-btn" href="#/" aria-label="ホームに戻る">' + icon('back', 22, '#fff') + '</a>' +
+      (badge ? '<span class="badge-sm tone-' + tone + '">' + esc(badge) + '</span>' : '') +
+      '<h1 class="bar-title">' + esc(title) + '</h1>' +
+      '</header>' + drillStrip();
+  }
+
+  /* ---------- 放送内容の組み立て ---------- */
+  function setupFor(p) {
+    if (!S.setup[p.id]) {
+      var opts = {};
+      (p.options || []).forEach(function (o) { opts[o.id] = !!o.default; });
+      S.setup[p.id] = { floor: null, repeat: p.defaultRepeat || 1, opts: opts };
+    }
+    return S.setup[p.id];
+  }
+  function resolveSegments(p, st, floorOverride) {
+    var fid = floorOverride || st.floor;
+    var fl = floorInfo(fid);
+    var abId = p.floor === 'fireAndAbove' && fid ? aboveOf(fid) : null;
+    var ab = floorInfo(abId);
+    var noAbove = p.floor === 'fireAndAbove' && fid && !abId;
+    return p.segments.filter(function (s) {
+      if (s.option && !st.opts[s.option]) return false;
+      if (s.type === 'speech' && !langOk(s.lang)) return false;
+      return true;
+    }).map(function (s) {
+      var t = noAbove && s.textNoAbove ? s.textNoAbove : s.text;
+      var k = noAbove && s.kanaNoAbove ? s.kanaNoAbove : s.kana;
+      return {
+        type: s.type, sound: s.sound, lang: s.lang, label: s.label,
+        firstLoopOnly: !!s.firstLoopOnly,
+        text: fill(t, fl, ab), kana: fill(k, fl, ab)
+      };
+    });
+  }
+  function buildSteps(segs, repeat) {
+    var steps = [];
+    for (var r = 0; r < repeat; r++) {
+      if (r > 0) steps.push({ kind: 'pause', ms: 1500, label: '間', loop: r });
+      segs.forEach(function (s) {
+        if (s.type === 'sound') {
+          if (r > 0 && s.firstLoopOnly) return;
+          steps.push({ kind: 'sound', sound: s.sound, label: s.label, loop: r });
+        } else {
+          if (!langOk(s.lang)) return; // 選んでいない言語の文は絶対に流さない（英語のみ → 役員招集は流れない）
+          steps.push({ kind: 'speech', lang: s.lang, text: s.text, label: s.label, loop: r });
+        }
+      });
+    }
+    return wrapDrill(steps);
+  }
+
+  /* ---------- ホーム ---------- */
+  function readiness() {
+    if (!SP.supported()) {
+      return { tone: 'danger', title: 'この端末・ブラウザは読み上げに対応していません', sub: 'Safari（iPhone）または Chrome（Android）で開いてください' };
+    }
+    var all = SP.voices();
+    if (!all.length) return { tone: 'neutral', title: '読み上げ音声を確認しています…', sub: '数秒たっても変わらない場合は再読み込み' };
+    var v = currentVoices();
+    if (!v.ja) return { tone: 'danger', title: '日本語の読み上げ音声が見つかりません', sub: '端末の設定で日本語の音声を追加してください' };
+    if (!v.en) return { tone: 'warn', title: '英語の読み上げ音声が見つかりません', sub: '日本語のみ再生されます。端末の設定で英語（米国）の音声を追加' };
+    var off = navigator.serviceWorker && navigator.serviceWorker.controller ? 'オフライン起動OK' : '初回読み込み中（次回からオフライン起動可）';
+    var local = v.ja.localService && v.en.localService ? '' : '　※一部の音声は通信が必要な可能性';
+    return { tone: 'ok', title: '読み上げ準備OK　' + off, sub: '日本語：' + v.ja.name + '　／　英語：' + v.en.name + local };
+  }
+  function modeSwitch() {
+    var d = isDrill();
+    var h = '<section class="mode" aria-label="動作モード"><div class="mode-h"><b>動作モード</b>' +
+      '<small>' + (d ? '開き直すと本番に戻ります' : '') + '</small></div>' +
+      '<div class="mode-seg" role="group" aria-label="本番と訓練の切り替え">' +
+      '<button type="button" class="m-live ' + (d ? '' : 'is-on') + '" data-act="mode" data-v="live" aria-pressed="' + !d + '">' +
+      icon('bell', 18) + '本番</button>' +
+      '<button type="button" class="m-drill ' + (d ? 'is-on' : '') + '" data-act="mode" data-v="drill" aria-pressed="' + d + '">' +
+      icon('flag', 18) + '訓練</button></div>';
+    h += '<div class="mode-note">' + (d
+      ? '訓練中です。すべての放送の最初に「ただいまから訓練放送を行います。これは訓練です。」、最後に「以上で訓練放送を終わります。」が入ります。3時間たつと自動で本番に戻ります。'
+      : '本番の放送です。消防訓練のときは「訓練」に切り替えてください。') + '</div></section>';
+    return h;
+  }
+  function renderHome() {
+    var r = readiness();
+    var html = '<header class="bar bar-home">' +
+      '<div class="brand">' + icon('speaker', 24, '#fff') +
+      '<div><div class="brand-name">館内放送アシスト</div><div class="brand-sub">' +
+      (isDrill() ? 'DRILL MODE · 訓練' : 'PA ASSIST · JA / EN') + '</div></div></div>' +
+      '<a class="icon-btn" href="#/settings" aria-label="設定">' + icon('gear', 22, '#fff') + '</a>' +
+      '</header>' + drillStrip();
+    if (S.drillExpired) {
+      html += '<div class="expired" role="status">訓練モードを始めてから3時間たったため、自動で本番に戻しました。</div>';
+    }
+    html += modeSwitch();
+    html += '<div class="ready tone-' + r.tone + '"><span class="ready-ic">' +
+      icon(r.tone === 'ok' ? 'check' : 'alert', 18) + '</span><div><div class="ready-t">' + esc(r.title) +
+      '</div><div class="ready-s">' + esc(r.sub) + '</div></div></div>';
+
+    html += '<main class="home">';
+    S.data.groups.forEach(function (g) {
+      html += '<div class="group-h tone-text-' + (g.id === 'fire' ? 'fire' : 'info') + '">' +
+        esc(g.label) + '　<span>' + esc(g.labelEn) + '</span></div>';
+      var ps = S.data.patterns.filter(function (p) { return p.group === g.id; });
+      html += '<div class="cards ' + (ps.length === 2 ? 'cards-2' : '') + '">';
+      ps.forEach(function (p) {
+        html += '<a class="card" href="#/p/' + p.id + '">' +
+          '<span class="letter tone-' + p.tone + '">' + esc(p.id) + '</span>' +
+          '<span class="card-body"><span class="card-t">' + esc(p.title) + '</span>' +
+          '<span class="card-s">' + esc(p.subtitle) + '</span></span>' +
+          (ps.length === 2 ? '' : icon('chev', 20, '#5B5F68')) + '</a>';
+      });
+      html += '</div>';
+    });
+    html += '<div class="group-h">その他　<span>OTHER</span></div>' +
+      '<div class="cards cards-2">' +
+      '<a class="card card-sm" href="#/custom">' + icon('keyboard', 22) +
+      '<span class="card-body"><span class="card-t">臨時放送</span><span class="card-s">文字を入力して読み上げ</span></span></a>' +
+      '<a class="card card-sm" href="#/manual/A">' + icon('mic', 22) +
+      '<span class="card-body"><span class="card-t">手動読み上げ</span><span class="card-s">音が出ないとき</span></span></a>' +
+      '</div>';
+    html += '<p class="foot-note">アプリ <b>v' + APP_VERSION + '</b> ／ 文言データ ' + esc(S.data.version) + ' 版</p>';
+    html += '</main>';
+    app.innerHTML = html;
+  }
+
+  /* ---------- 放送パターン（準備画面） ---------- */
+  function renderPattern(id) {
+    var p = patternById(id);
+    if (!p) return go('#/');
+    var st = setupFor(p);
+    var html = header(p.title, p.id, p.tone) + '<main class="pad">';
+    html += targetSelector(p);
+    html += langSelector();
+
+    if (p.floor) {
+      var fl = floorInfo(st.floor);
+      var abId = st.floor ? aboveOf(st.floor) : null;
+      html += '<div class="lead">' + esc(p.floorPrompt) + '</div>';
+      if (p.floor === 'fireAndAbove') {
+        html += '<div class="floor-pair">' +
+          '<div class="floor-box ' + (fl ? 'is-set' : '') + '"><span>火元階　避難</span><b>' + (fl ? esc(fl.ja) : '未選択') + '</b></div>' +
+          '<div class="floor-box dashed ' + (fl ? 'is-set' : '') + '"><span>直上階　避難（自動）</span><b>' +
+          (fl ? (abId ? esc(floorInfo(abId).ja) : 'なし（最上階）') : '—') + '</b></div></div>';
+      } else {
+        html += '<div class="floor-box wide ' + (fl ? 'is-set' : '') + '"><div><span>放送する階</span><b>' +
+          (fl ? esc(fl.ja) : '未選択') + '</b></div><em>' + (fl ? esc(fl.en) : '') + '</em></div>';
+      }
+      html += '<div class="floor-grid" role="group" aria-label="階の選択">';
+      S.data.floors.list.forEach(function (f) {
+        var cls = 'fl';
+        if (f.charAt(0) === 'B') cls += ' fl-b';
+        if (f === st.floor) cls += ' is-on';
+        else if (p.floor === 'fireAndAbove' && f === abId) cls += ' is-above';
+        html += '<button type="button" class="' + cls + '" data-act="floor" data-v="' + f + '" aria-pressed="' +
+          (f === st.floor) + '" aria-label="' + esc(floorInfo(f).ja) + '">' + f + '</button>';
+      });
+      html += '</div>';
+    }
+
+    (p.options || []).forEach(function (o) {
+      if (!optionVisible(p, o)) return;
+      html += '<label class="toggle"><span><b>' + esc(o.label) + '</b><small>' + esc(o.hint || '') + '</small></span>' +
+        '<input type="checkbox" data-act="opt" data-v="' + o.id + '"' + (st.opts[o.id] ? ' checked' : '') + '></label>';
+    });
+
+    html += '<div class="row"><span class="row-l">繰り返し</span><div class="seg" role="group" aria-label="繰り返し回数">';
+    [1, 2, 3].forEach(function (n) {
+      html += '<button type="button" data-act="repeat" data-v="' + n + '" class="' + (st.repeat === n ? 'is-on' : '') +
+        '" aria-pressed="' + (st.repeat === n) + '">' + n + '回</button>';
+    });
+    html += '</div></div>';
+
+    if (icMode(p)) { html += icPatternBody(p, st); html += '</main>'; app.innerHTML = html; return; }
+    var segs = resolveSegments(p, st);
+    var needJa = segs.some(function (x) { return x.lang === 'ja'; });
+    var needEn = segs.some(function (x) { return x.lang === 'en'; });
+    var miss = missingVoice(needJa, needEn);
+    var ready = (!p.floor || !!st.floor) && !miss;
+    var fl2 = floorInfo(st.floor);
+    var label = miss ? miss : (p.floor && !st.floor ? '階を選んでください' :
+      (isDrill() ? '【訓練】' : '') + (fl2 ? fl2.ja + 'で放送開始' : '放送開始'));
+    html += '<button type="button" class="go tone-' + p.tone + '" data-act="start" ' + (ready ? '' : 'disabled') + '>' +
+      icon('play', 22, '#fff') + esc(label) + '</button>';
+
+    var all = drillSegs('start').concat(segs, drillEnd(segs));
+    html += '<div class="seq">' + seqLabel(segs, st.repeat) + '</div>';
+
+    html += '<details class="preview"><summary>放送内容を確認</summary>';
+    all.forEach(function (s) {
+      if (s.type === 'speech') {
+        html += '<div class="pv' + (s.drill ? ' is-drill' : '') + '"><span class="pv-l">' + esc(s.label) + '</span><p lang="' + s.lang + '">' + esc(s.text) + '</p></div>';
+      }
+    });
+    html += '</details>';
+    html += '<a class="sub-link" href="#/manual/' + p.id + (st.floor ? '/' + st.floor : '') + '">' + icon('mic', 18) +
+      '音が出ないとき：手動読み上げ（カタカナ読み）</a>';
+    html += '</main>';
+    app.innerHTML = html;
+  }
+  /* インターホン一斉：短縮版の一覧と開始ボタン */
+  function icPatternBody(p, st) {
+    var parts = resolveParts(p, st);
+    var html = '';
+    var needJa = parts.some(function (x) { return x.lang === 'ja'; });
+    var needEn = parts.some(function (x) { return x.lang === 'en'; });
+    var miss = missingVoice(needJa, needEn);
+    var ready = (!p.floor || !!st.floor) && !miss && parts.length > 0;
+    var fl = floorInfo(st.floor);
+    var label = miss ? miss : (p.floor && !st.floor ? '階を選んでください' :
+      (isDrill() ? '【訓練】' : '') + 'インターホンで放送　' + parts.length + '件' + (st.repeat > 1 ? '×' + st.repeat + '回' : ''));
+    html += '<button type="button" class="go tone-' + p.tone + '" data-act="icstart" ' + (ready ? '' : 'disabled') + '>' +
+      icon('play', 22, '#fff') + esc(label) + '</button>';
+    html += '<div class="ic-list">';
+    parts.forEach(function (x, i) {
+      var sec = partSec(x);
+      var over = sec > 27;
+      html += '<div class="pv ic-part' + (over ? ' is-over' : '') + '"><span class="pv-l">' + (i + 1) + '. ' + esc(x.label) +
+        '　<em>約' + sec + '秒' + (over ? '　※30秒を超えるおそれ（速さを上げる／手動で読む）' : '') + '</em></span>' +
+        '<p lang="' + x.lang + '">' + esc(x.text) + '</p></div>';
+    });
+    html += '</div>';
+    if (isDrill()) html += '<div class="tip">訓練モード：各回の最初に「訓練放送です。」が入ります（30秒に収めるため、終わりの文は入りません）。</div>';
+    html += '<a class="sub-link" href="#/manual/' + p.id + (st.floor ? '/' + st.floor : '') + '">' + icon('mic', 18) +
+      '音が出ないとき：手動読み上げ（インターホンの受話器で読む）</a>';
+    return html;
+  }
+  function icPlayPart() {
+    var R2 = S.icRun;
+    if (!R2) return;
+    var part = R2.parts[R2.idx];
+    var total = R2.parts.length * R2.cycles;
+    var n = R2.cycle * R2.parts.length + R2.idx + 1;
+    var nextPart = R2.idx + 1 < R2.parts.length ? R2.parts[R2.idx + 1] : (R2.cycle + 1 < R2.cycles ? R2.parts[0] : null);
+    var title = (R2.drill ? '【訓練】' : '') + R2.p.id + ' インターホン一斉 ' + n + ' / ' + total;
+    startPlayback(title, part.label + '　／　' + R2.sub, partSteps(part), R2.href, {
+      drill: R2.drill, again: icPlayPart,
+      ic: { label: part.label, next: nextPart ? nextPart.label : '' }
+    });
+  }
+  function drillEnd() { return drillSegs('end'); }
+  function seqLabel(segs, repeat) {
+    var sounds = segs.filter(function (s) { return s.type === 'sound'; }).map(function (s) { return s.label; });
+    var speech = segs.filter(function (s) { return s.type !== 'sound'; }).map(function (s) { return s.label; }).join(' → ');
+    if (repeat > 1) speech = '［' + speech + '］× ' + repeat + '回';
+    var parts = sounds.concat(isDrill() ? ['訓練（開始）'] : [], [speech], isDrill() ? ['訓練（終了）'] : []);
+    return esc(parts.join(' → '));
+  }
+
+  /* ---------- 手動読み上げ ---------- */
+  function renderManual(id, floor) {
+    var p = patternById(id);
+    if (!p) return go('#/');
+    var st = setupFor(p);
+    var ic = icMode(p);
+    var body = ic ? resolveParts(p, st, floor) : resolveSegments(p, st, floor).filter(function (s) { return s.type === 'speech'; });
+    var segs = ic ? body : drillSegs('start').concat(body, drillSegs('end'));
+    if (S.manualStep >= segs.length) S.manualStep = 0;
+    var fl = floorInfo(floor || st.floor);
+    var html = header('手動読み上げ', p.id, p.tone) + '<main class="pad">';
+
+    html += '<div class="seg seg-wide" role="group" aria-label="パターン">';
+    S.data.patterns.forEach(function (q) {
+      html += '<a class="' + (q.id === p.id ? 'is-on' : '') + '" href="#/manual/' + q.id + '">' + q.id + '</a>';
+    });
+    html += '</div>';
+    html += targetSelector(p);
+    html += langSelector();
+    html += '<div class="tip">' + (ic ? 'インターホンの一斉放送で、1件ずつ（各30秒以内）読んでください。' + (isDrill() ? '各回の最初に「訓練放送です。」と言ってください。' : '') + '<br>' : '') + '放送設備のマイクで、この文をそのまま読んでください。「／」で一呼吸。英語はカタカナを、ゆっくり・はっきり。' +
+      (isDrill() ? '<br><b>訓練モード：最初と最後の「訓練」の文も必ず読んでください。</b>' : '') +
+      (p.floor && !fl ? '<br><b>階数が未選択のため「〇〇階」と表示しています。</b>' : '') + '</div>';
+
+    html += '<div class="tabs" role="tablist">';
+    segs.forEach(function (s, i) {
+      html += '<button type="button" role="tab" data-act="mstep" data-v="' + i + '" class="' + (s.drill ? 'is-drill ' : '') +
+        (i === S.manualStep ? 'is-on' : '') + '" aria-selected="' + (i === S.manualStep) + '">' + (i + 1) + '. ' + esc(s.label) + '</button>';
+    });
+    html += '</div>';
+
+    var s = segs[S.manualStep];
+    html += '<section class="read">';
+    if (s && s.lang === 'ja') {
+      SP.splitSentences(s.text, 'ja').forEach(function (line) {
+        html += '<p class="read-ja">' + esc(line) + '</p>';
+      });
+    } else if (s) {
+      (s.kana || '').split('／').forEach(function (line) {
+        if (line.trim()) html += '<p class="read-kana">' + esc(line.trim()) + '</p>';
+      });
+      html += '<p class="read-en" lang="en">' + esc(s.text) + '</p>';
+    }
+    html += '</section>';
+    html += '<div class="pager"><button type="button" data-act="mprev" ' + (S.manualStep === 0 ? 'disabled' : '') + '>前へ</button>' +
+      '<button type="button" class="dark" data-act="mnext" ' + (S.manualStep >= segs.length - 1 ? 'disabled' : '') + '>次へ</button></div>';
+    html += '</main>';
+    app.innerHTML = html;
+  }
+
+  /* ---------- 臨時放送 ---------- */
+  function customState() {
+    if (!S.custom) {
+      var t = S.data.customTemplates[0];
+      S.custom = { tpl: t.id, ja: t.ja, en: t.en, chime: true, repeat: 2, error: '' };
+    }
+    return S.custom;
+  }
+  function renderCustom() {
+    var c = customState();
+    var html = header('臨時放送（文字入力→読み上げ）') + '<main class="pad">';
+    html += '<div class="tip">端末の読み上げ音声で流します。火災・地震・津波は定型放送（A〜E）を優先してください。</div>';
+    html += '<div class="lead-sm">ひな形から選ぶ</div><div class="chips">';
+    S.data.customTemplates.forEach(function (t) {
+      html += '<button type="button" class="chip ' + (c.tpl === t.id ? 'is-on' : '') + '" data-act="tpl" data-v="' + t.id + '">' + esc(t.label) + '</button>';
+    });
+    html += '</div>';
+    var m = langMode();
+    html += langSelector();
+    if (m !== 'en') {
+      html += '<label class="field"><span>日本語<small>［ ］の部分を書き換えてください</small></span>' +
+        '<textarea rows="4" data-act="cja" lang="ja">' + esc(c.ja) + '</textarea></label>';
+    }
+    if (m !== 'ja') {
+      html += '<label class="field"><span>English<small>ひな形には対訳が入っています</small></span>' +
+        '<textarea rows="4" data-act="cen" lang="en">' + esc(c.en) + '</textarea></label>';
+    }
+    html += '<label class="toggle"><span><b>最初にチャイムを鳴らす</b></span>' +
+      '<input type="checkbox" data-act="cchime"' + (c.chime ? ' checked' : '') + '></label>';
+    html += '<div class="row"><span class="row-l">繰り返し</span><div class="seg" role="group" aria-label="繰り返し回数">';
+    [1, 2, 3].forEach(function (n) {
+      html += '<button type="button" data-act="crepeat" data-v="' + n + '" class="' + (c.repeat === n ? 'is-on' : '') + '">' + n + '回</button>';
+    });
+    html += '</div></div>';
+    html += '<div class="error" role="alert" id="cerr">' + esc(c.error) + '</div>';
+    html += '<div class="two"><button type="button" class="ghost" data-act="ctest">' + icon('ear', 18) + '試聴</button>' +
+      '<button type="button" class="go tone-dark" data-act="cstart">' + icon('play', 20, '#fff') + (isDrill() ? '【訓練】' : '') + '放送開始</button></div>';
+    html += '</main>';
+    app.innerHTML = html;
+  }
+  function customValidate(c) {
+    var m = langMode();
+    var useJa = m !== 'en', useEn = m !== 'ja';
+    if (useJa && !c.ja.trim()) return '日本語の文を入力してください。';
+    if (useEn && !c.en.trim()) return '英語の文を入力してください。';
+    if ((useJa && /[［\[]/.test(c.ja)) || (useEn && /[［\[]/.test(c.en))) return '［ ］の部分が残っています。書き換えてから放送してください。';
+    return missingVoice(useJa, useEn);
+  }
+
+  /* ---------- 設定 ---------- */
+  function renderSettings() {
+    var v = currentVoices();
+    function opts(lang, saved) {
+      var list = SP.voicesFor(lang);
+      var h = '<option value="">おすすめ（自動選択）</option>';
+      list.forEach(function (x) {
+        h += '<option value="' + esc(x.name) + '"' + (x.name === saved ? ' selected' : '') + '>' +
+          esc(x.name) + '（' + esc(x.lang) + (x.localService ? '・端末内' : '・通信') + '）</option>';
+      });
+      return h;
+    }
+    var html = header('設定・テスト') + '<main class="pad">';
+    html += '<div class="lead-sm">日本語の音声</div><select data-act="jav">' + opts('ja', S.settings.jaVoice) + '</select>' +
+      '<div class="now">使用中：' + (v.ja ? esc(v.ja.name) : 'なし') + '</div>';
+    html += '<div class="lead-sm">英語の音声</div><select data-act="env">' + opts('en', S.settings.enVoice) + '</select>' +
+      '<div class="now">使用中：' + (v.en ? esc(v.en.name) : 'なし') + '</div>';
+    html += '<div class="lead-sm">読み上げの速さ　<b id="ratev">' + S.settings.rate.toFixed(2) + '</b>（放送は 0.85〜0.95 推奨）</div>' +
+      '<input type="range" min="0.7" max="1.2" step="0.05" value="' + S.settings.rate + '" data-act="rate" aria-label="読み上げの速さ">';
+    html += '<div class="lead-sm">テスト</div><div class="grid2">' +
+      '<button type="button" class="ghost" data-act="tja">日本語テスト</button>' +
+      '<button type="button" class="ghost" data-act="ten">英語テスト</button>' +
+      '<button type="button" class="ghost" data-act="tchime">チャイム</button>' +
+      '<button type="button" class="ghost" data-act="tsiren">警報音</button></div>';
+    html += '<details class="preview" open><summary>導入時のチェック（管理員の端末ごとに1回）</summary><ol class="check">' +
+      '<li>ホーム画面に追加して、そのアイコンから起動する（iPhone：共有 → ホーム画面に追加 ／ Android：︙ → ホーム画面に追加）</li>' +
+      '<li>上の4つのテストがすべて聞こえる</li>' +
+      '<li>マナーモード（消音スイッチ）ONでも聞こえるか確認する</li>' +
+      '<li>機内モードにしてアプリを起動し、読み上げできることを確認する</li>' +
+      '<li>放送設備（マイクまたは外部入力）を通して館内で聞き取れる音量か確認する</li>' +
+      '<li>インターホンの一斉放送でも流し、住戸内で聞き取れること、1件が30秒以内に収まることを確認する</li></ol></details>';
+    html += '<button type="button" class="ghost wide" data-act="refresh">最新の版を読み込み直す</button>';
+    html += '<p class="foot-note">アプリ v' + APP_VERSION + ' ／ 文言データ ' + esc(S.data.version) + ' 版<br>' + esc(S.data.source) + '</p>';
+    html += '</main>';
+    app.innerHTML = html;
+  }
+
+  /* ---------- 放送中 ---------- */
+  function startPlayback(title, sub, steps, manualHref, opts) {
+    SP.unlock();
+    opts = opts || {};
+    S.playing = {
+      title: title, sub: sub, steps: steps, idx: 0, sentence: -1, sentences: [],
+      startedAt: Date.now(), done: false, manualHref: manualHref,
+      drill: !!opts.drill,
+      ic: opts.ic || null,
+      loops: steps.reduce(function (m, s) { return Math.max(m, (s.loop || 0) + 1); }, 1),
+      again: opts.again
+    };
+    requestWake();
+    renderOnAir();
+    var v = currentVoices();
+    SP.play(steps, { voices: v, rate: S.settings.rate, fixes: S.data.speechFixes }, {
+      onStep: function (i, s, k, sentences) {
+        if (!S.playing) return;
+        S.playing.idx = i; S.playing.sentence = k; S.playing.sentences = sentences;
+        renderOnAir();
+      }
+    }).then(function (completed) {
+      if (!S.playing) return;
+      if (completed) { S.playing.done = true; renderOnAir(); }
+      releaseWake();
+    });
+  }
+  function stopPlayback() {
+    SP.stop();
+    S.playing = null;
+    releaseWake();
+    overlay.hidden = true;
+    overlay.innerHTML = '';
+    overlay.classList.remove('is-drill');
+    document.body.classList.remove('is-onair');
+    if (S.pendingReload) { S.pendingReload = false; location.reload(); }
+  }
+  function fmt(ms) {
+    var s = Math.floor(ms / 1000);
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+  function oaTime(P) {
+    if (!P.ic) return fmt(Date.now() - P.startedAt);
+    var left = Math.ceil((IC_LIMIT_MS - (Date.now() - P.startedAt)) / 1000);
+    return left > 0 ? '残り ' + left + ' 秒' : '30秒超過';
+  }
+  function renderOnAir() {
+    var P = S.playing;
+    if (!P) return;
+    overlay.hidden = false;
+    overlay.classList.toggle('is-drill', P.drill);
+    document.body.classList.add('is-onair');
+    var step = P.steps[P.idx] || {};
+    var loop = (step.loop || 0);
+    var inLoop = P.steps.filter(function (s) { return (s.loop || 0) === loop && s.kind !== 'pause'; });
+    var pill = P.done ? '放送終了' : (P.drill ? '訓練放送中　DRILL' : '放送中　ON AIR');
+    var html = '<div class="oa-head">' +
+      '<div class="oa-pill ' + (P.done ? 'is-done' : (P.drill ? 'is-drill' : '')) + '"><span class="dot"></span>' + pill + '</div>' +
+      '<span class="oa-time' + (P.ic ? ' is-ic' : '') + '" id="oatime">' + oaTime(P) + '</span></div>' +
+      '<div class="oa-title"><b>' + esc(P.title) + '</b><span>' + (P.loops > 1 ? (loop + 1) + ' / ' + P.loops + ' 回目' : '') + '</span></div>' +
+      (P.sub ? '<div class="oa-sub">' + esc(P.sub) + '</div>' : '');
+    html += '<div class="oa-steps">';
+    inLoop.forEach(function (s) {
+      var gi = P.steps.indexOf(s);
+      var cls = P.done || gi < P.idx ? 'done' : (gi === P.idx ? 'now' : '');
+      html += '<span class="' + cls + '">' + (cls === 'done' ? icon('check', 13) : '') + esc(s.label) + '</span>';
+    });
+    html += '</div>';
+
+    html += '<section class="oa-card">';
+    if (P.done && P.ic) {
+      html += '<p class="oa-text">「' + esc(P.ic.label) + '」を流しました。</p>' +
+        (P.ic.next ? '<div class="oa-next"><span>次：</span>' + esc(P.ic.next) + '<br>インターホンの一斉放送ボタンを押してから、下の「次を流す」をタップ</div>'
+          : '<div class="oa-next">すべて流し終えました。</div>');
+    } else if (P.done) {
+      html += '<p class="oa-text">' + (P.drill ? '訓練放送が終わりました。' : '放送が終わりました。') + '</p>';
+    } else if (step.kind === 'speech') {
+      html += '<div class="oa-cap">いま流れている文（窓口で画面を見せても可）</div><p class="oa-text" lang="' + step.lang + '">';
+      P.sentences.forEach(function (t, k) {
+        html += '<span class="' + (k === P.sentence ? 'cur' : (k < P.sentence ? 'past' : 'fut')) + '">' + esc(t) + ' </span>';
+      });
+      html += '</p>';
+    } else if (step.kind === 'sound') {
+      html += '<p class="oa-text">' + esc(step.label) + '…</p>';
+    } else {
+      html += '<p class="oa-text">次の繰り返しまで少し待機…</p>';
+    }
+    var next = P.steps.slice(P.idx + 1).filter(function (s) { return s.kind === 'speech'; })[0];
+    if (next && !P.done) html += '<div class="oa-next"><span>次：</span>' + esc(next.label) + '　' + esc(next.text.slice(0, 60)) + '…</div>';
+    html += '</section>';
+
+    html += '<div class="oa-chips"><span>' + (S.wakeLock ? '画面スリープ防止中' : '再生中は画面を消さないでください') + '</span>' +
+      '<span>端末の読み上げ音声</span>' + (P.drill ? '<span>訓練モード</span>' : '') + '</div>';
+    html += '<div class="oa-grow"></div><div class="oa-actions">';
+    if (P.done && P.ic && P.ic.next) {
+      html += '<button type="button" class="stop" data-act="icnext">' + icon('play', 26, '#fff') + '次を流す（' + esc(P.ic.next) + '）</button>' +
+        '<div class="two"><button type="button" class="ghost-dark" data-act="again">今の分をもう一度</button>' +
+        '<button type="button" class="close" data-act="icend">中止して閉じる</button></div>';
+    } else if (P.done) {
+      html += '<div class="two">' + (P.again ? '<button type="button" class="ghost-dark" data-act="again">もう一度流す</button>' : '') +
+        '<button type="button" class="close" data-act="close">閉じる</button></div>';
+    } else {
+      if (P.manualHref) html += '<button type="button" class="ghost-dark" data-act="tomanual">' + icon('mic', 18) + '音が出ない → 手動読み上げに切替</button>';
+      html += '<button type="button" class="stop" data-act="stop">' + icon('stop', 30, '#fff') + '停止　STOP</button>';
+    }
+    html += '</div>';
+    overlay.innerHTML = html;
+  }
+  setInterval(function () {
+    if (S.playing && !S.playing.done) {
+      var el = document.getElementById('oatime');
+      if (el) {
+        el.textContent = oaTime(S.playing);
+        el.classList.toggle('is-warn', !!S.playing.ic && Date.now() - S.playing.startedAt > IC_LIMIT_MS - 5000);
+      }
+    }
+    // 訓練モードの自動解除（放送中は解除しない）
+    if (S.drill && !S.playing && Date.now() - S.drillSince > DRILL_TIMEOUT_MS) { isDrill(); render(); }
+  }, 500);
+
+  function requestWake() {
+    if (!('wakeLock' in navigator)) return;
+    navigator.wakeLock.request('screen').then(function (l) {
+      S.wakeLock = l;
+      l.addEventListener('release', function () { S.wakeLock = null; });
+      renderOnAir();
+    }).catch(function () { S.wakeLock = null; });
+  }
+  function releaseWake() {
+    if (S.wakeLock) { try { S.wakeLock.release(); } catch (e) { /* noop */ } S.wakeLock = null; }
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && S.playing && !S.playing.done && !S.wakeLock) requestWake();
+  });
+
+  /* ---------- 操作 ---------- */
+  function go(h) { location.hash = h; }
+
+  function onClick(e) {
+    var el = e.target.closest('[data-act]');
+    SP.unlock();
+    if (!el || el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return;
+    var act = el.getAttribute('data-act');
+    var v = el.getAttribute('data-v');
+    var r = S.route;
+    var p = r.id ? patternById(r.id) : null;
+
+    switch (act) {
+      case 'mode': setDrill(v === 'drill'); render(); break;
+      case 'lang': S.settings.lang = v; saveSettings(); render(); break;
+      case 'target': S.settings.target = v; saveSettings(); S.manualStep = 0; render(); break;
+      case 'icstart': {
+        var sti = setupFor(p);
+        if (p.floor && !sti.floor) return;
+        var parts = resolveParts(p, sti);
+        if (!parts.length) return;
+        var fli = floorInfo(sti.floor);
+        S.icRun = {
+          p: p, parts: parts, idx: 0, cycle: 0, cycles: sti.repeat, drill: isDrill(),
+          sub: (fli ? fli.ja + '　／　' : '') + langLabel(),
+          href: '#/manual/' + p.id + (sti.floor ? '/' + sti.floor : '')
+        };
+        icPlayPart();
+        break;
+      }
+      case 'icnext': {
+        var R3 = S.icRun;
+        if (!R3) break;
+        stopPlayback();
+        R3.idx++;
+        if (R3.idx >= R3.parts.length) { R3.idx = 0; R3.cycle++; }
+        if (R3.cycle >= R3.cycles) { S.icRun = null; break; }
+        icPlayPart();
+        break;
+      }
+      case 'icend': S.icRun = null; stopPlayback(); break;
+      case 'floor': setupFor(p).floor = v; renderPattern(p.id); break;
+      case 'repeat': setupFor(p).repeat = parseInt(v, 10); renderPattern(p.id); break;
+      case 'start': {
+        var st = setupFor(p);
+        if (p.floor && !st.floor) return;
+        var fl = floorInfo(st.floor);
+        var sub = fl ? '警報作動階：' + fl.ja : '';
+        if (p.floor === 'fireAndAbove') {
+          var ab = aboveOf(st.floor);
+          sub = '避難：' + fl.ja + (ab ? '・' + floorInfo(ab).ja : '') + (st.opts.standby ? '　／　その他の階：待機' : '');
+        }
+        sub = (sub ? sub + '　／　' : '') + langLabel();
+        var drill = isDrill();
+        var title = (drill ? '【訓練】' : '') + p.id + ' ' + p.title;
+        var steps = buildSteps(resolveSegments(p, st), st.repeat);
+        var href = '#/manual/' + p.id + (st.floor ? '/' + st.floor : '');
+        var run = function () { startPlayback(title, sub, steps, href, { again: run, drill: drill }); };
+        run();
+        break;
+      }
+      case 'mstep': S.manualStep = parseInt(v, 10); render(); break;
+      case 'mprev': S.manualStep = Math.max(0, S.manualStep - 1); render(); break;
+      case 'mnext': S.manualStep += 1; render(); break;
+      case 'tpl': {
+        var t = S.data.customTemplates.filter(function (x) { return x.id === v; })[0];
+        var c = customState();
+        c.tpl = t.id; c.ja = t.ja; c.en = t.en; c.error = '';
+        renderCustom();
+        break;
+      }
+      case 'crepeat': customState().repeat = parseInt(v, 10); renderCustom(); break;
+      case 'ctest':
+      case 'cstart': {
+        var c2 = customState();
+        c2.error = customValidate(c2);
+        if (c2.error) { document.getElementById('cerr').textContent = c2.error; return; }
+        var steps2 = [];
+        var test = act === 'ctest';
+        var rep = test ? 1 : c2.repeat;
+        for (var i = 0; i < rep; i++) {
+          if (i > 0) steps2.push({ kind: 'pause', ms: 1500, label: '間', loop: i });
+          if (i === 0 && c2.chime && !test) steps2.push({ kind: 'sound', sound: 'chime', label: 'チャイム', loop: i });
+          if (langMode() !== 'en') steps2.push({ kind: 'speech', lang: 'ja', text: c2.ja.trim(), label: '日本語', loop: i });
+          if (langMode() !== 'ja') steps2.push({ kind: 'speech', lang: 'en', text: c2.en.trim(), label: 'English', loop: i });
+        }
+        var drill2 = isDrill() && !test;
+        if (drill2) steps2 = wrapDrill(steps2);
+        var ttl = test ? '臨時放送（試聴）' : (drill2 ? '【訓練】臨時放送' : '臨時放送');
+        var csub = test ? '放送設備につなぐ前に端末で確認' : langLabel();
+        var run2 = function () { startPlayback(ttl, csub, steps2, null, { again: run2, drill: drill2 }); };
+        run2();
+        break;
+      }
+      case 'tja': startPlayback('日本語テスト', '', [{ kind: 'speech', lang: 'ja', text: 'こちらは１階管理事務室です。これは放送のテストです。', label: '日本語' }], null); break;
+      case 'ten': startPlayback('英語テスト', '', [{ kind: 'speech', lang: 'en', text: 'This is the management office. This is a test announcement.', label: 'English' }], null); break;
+      case 'tchime': SP.chime(); break;
+      case 'tsiren': SP.siren(); break;
+      case 'refresh': refreshApp(); break;
+      case 'stop': S.icRun = null; stopPlayback(); break;
+      case 'close': S.icRun = null; stopPlayback(); break;
+      case 'again': { var a = S.playing && S.playing.again; stopPlayback(); if (a) a(); break; }
+      case 'tomanual': { var h = S.playing.manualHref; stopPlayback(); S.manualStep = 0; go(h); break; }
+    }
+  }
+
+  function onInput(e) {
+    var el = e.target;
+    var act = el.getAttribute && el.getAttribute('data-act');
+    if (!act) return;
+    var c = S.custom;
+    switch (act) {
+      case 'opt': setupFor(patternById(S.route.id)).opts[el.getAttribute('data-v')] = el.checked; renderPattern(S.route.id); break;
+      case 'cja': c.ja = el.value; break;
+      case 'cen': c.en = el.value; break;
+      case 'cchime': c.chime = el.checked; break;
+      case 'jav': S.settings.jaVoice = el.value; saveSettings(); renderSettings(); break;
+      case 'env': S.settings.enVoice = el.value; saveSettings(); renderSettings(); break;
+      case 'rate':
+        S.settings.rate = parseFloat(el.value); saveSettings();
+        var rv = document.getElementById('ratev'); if (rv) rv.textContent = S.settings.rate.toFixed(2);
+        break;
+    }
+  }
+
+  /* ---------- ルーティング ---------- */
+  function parseRoute() {
+    var h = (location.hash || '#/').replace(/^#/, '');
+    var parts = h.split('/').filter(Boolean);
+    if (parts[0] === 'p' && parts[1]) return { name: 'pattern', id: parts[1] };
+    if (parts[0] === 'manual') return { name: 'manual', id: parts[1] || 'A', floor: parts[2] || null };
+    if (parts[0] === 'custom') return { name: 'custom' };
+    if (parts[0] === 'settings') return { name: 'settings' };
+    return { name: 'home' };
+  }
+  function render() {
+    var r = S.route;
+    if (r.name === 'pattern') renderPattern(r.id);
+    else if (r.name === 'manual') renderManual(r.id, r.floor);
+    else if (r.name === 'custom') renderCustom();
+    else if (r.name === 'settings') renderSettings();
+    else renderHome();
+  }
+  function onRoute() {
+    var prev = S.route;
+    S.route = parseRoute();
+    // ホームから入り直したときは階数を必ず選び直させる（前回の階で誤放送しないため）
+    if (S.route.name === 'pattern' && prev.name === 'home' && S.setup[S.route.id]) S.setup[S.route.id].floor = null;
+    if (S.route.name === 'manual' && (prev.name !== 'manual' || prev.id !== S.route.id)) S.manualStep = 0;
+    if (S.route.name !== 'home') S.drillExpired = false;
+    render();
+    window.scrollTo(0, 0);
+  }
+
+  /* ---------- Service Worker（オフライン化と更新） ----------
+   * 新しい版がGitHubに上がったら、次に開いたとき自動で入れ替えて再読み込みする。
+   * 放送中は再読み込みせず、停止・終了してから行う。
+   */
+  function registerSW() {
+    if (!('serviceWorker' in navigator)) return;
+    var hadController = !!navigator.serviceWorker.controller;
+    var refreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController) { hadController = true; if (S.route.name === 'home' && S.data) renderHome(); return; }
+      if (refreshing) return;
+      if (S.playing) { S.pendingReload = true; return; }
+      refreshing = true;
+      location.reload();
+    });
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then(function (reg) {
+      reg.update().catch(function () { /* オフライン */ });
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') reg.update().catch(function () { /* オフライン */ });
+      });
+    }).catch(function () { /* file:// 等では登録できない */ });
+  }
+  function refreshApp() {
+    if (!('serviceWorker' in navigator)) return location.reload();
+    navigator.serviceWorker.getRegistration().then(function (reg) {
+      if (!reg) return location.reload();
+      reg.update().then(function () { setTimeout(function () { location.reload(); }, 800); },
+        function () { location.reload(); });
+    });
+  }
+
+  /* ---------- 起動 ---------- */
+  function boot() {
+    applyModeClass();
+    document.addEventListener('click', onClick);
+    document.addEventListener('input', onInput);
+    document.addEventListener('change', onInput);
+    SP.onVoicesChanged(function () { if (S.data && (S.route.name === 'home' || S.route.name === 'settings')) render(); });
+
+    fetch('./data/announcements.json', { cache: 'no-cache' })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) {
+        S.data = d;
+        window.addEventListener('hashchange', onRoute);
+        onRoute();
+        // 一部の端末は音声一覧が遅れて届く
+        setTimeout(function () { if (S.route.name === 'home') renderHome(); }, 1200);
+      })
+      .catch(function () {
+        app.innerHTML = '<main class="pad"><div class="ready tone-danger"><div><div class="ready-t">文言データを読み込めませんでした</div>' +
+          '<div class="ready-s">通信状態を確認して再読み込みしてください（初回起動は通信が必要です）</div></div></div>' +
+          '<button class="ghost wide" onclick="location.reload()">再読み込み</button></main>';
+      });
+    registerSW();
+  }
+  boot();
+})();
